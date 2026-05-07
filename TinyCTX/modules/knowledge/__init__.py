@@ -1,0 +1,41 @@
+EXTENSION_META = {
+    "name":    "knowledge",
+    "version": "0.1",
+    "description": (
+        "Long-term memory backed by a KùzuDB property graph. "
+        "A persistent sidecar librarian process watches libbuffer/, extracts "
+        "entities and relationships from conversation history, and writes them "
+        "to the graph. The main agent reads via kg_search / kg_traverse tools "
+        "and can trigger librarian agents on demand via call_librarian. "
+        "Pinned entities are injected into the system prompt automatically."
+    ),
+    "default_config": {
+        # Paths (relative to workspace)
+        "graph_path":    "knowledge/graph.db",
+        "libbuffer_dir": "libbuffer",
+
+        # Librarian trigger config
+        "trigger_file_size_kb":   64,
+        "trigger_interval_hours": 6,
+        "batch_size":             20,
+        "max_concurrent":         4,
+
+        # Dedup cycle
+        "dedup_enabled":          True,
+        "dedup_interval_hours":   24,
+        "similarity_threshold":   0.85,
+
+        # Embedding model key from config.yaml models: (must be kind: embedding)
+        # Leave empty to disable semantic search (keyword only)
+        "embedding_model": "",
+
+        # IPC socket (Unix socket path or named pipe name on Windows)
+        "ipc_socket": "knowledge/librarian.sock",
+
+        # Pinned entity injection priority in system prompt
+        "pinned_priority": 5,
+
+        # LLM model key for librarian agents (defaults to primary)
+        "librarian_model": "",
+    },
+}
