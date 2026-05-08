@@ -28,17 +28,6 @@ Config (in config.yaml under bridges.matrix.options):
                      Default: "!"
   reset_command:     Command string that triggers a session reset in group rooms.
                      Default: "/reset"
-  buffer_timeout_s:  In group rooms, seconds to wait after a non-trigger
-                     message before flushing buffered messages anyway.
-                     0 = disabled (only flush on trigger). Default: 0
-  buffer_head_lines: When truncating a large burst, keep this many messages
-                     from the START (topic context). Default: 2
-  buffer_tail_lines: Messages to keep from the END of a truncated burst
-                     (closest to the trigger). Default: 10
-                     Omitted middle is replaced with:
-                     "... [N messages not shown] ..."
-                     Trigger detection, buffering, and truncation are all
-                     handled by GroupLane in router.py via GroupPolicy.
   max_reply_length:  Max characters per Matrix message before chunking.
                      Default: 16000
   sync_timeout_ms:   Long-poll timeout per /sync call in ms. Default: 30000
@@ -69,7 +58,6 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -86,17 +74,15 @@ try:
         RoomMessageAudio,
         RoomMessageFile,
         RoomMessageImage,
-        RoomMessageMedia,
         RoomMessageVideo,
     )
     _HAS_MEDIA_EVENTS = True
 except ImportError:
     RoomMessageAudio = RoomMessageFile = RoomMessageImage = None  # type: ignore
-    RoomMessageMedia = RoomMessageVideo = None                     # type: ignore
+    RoomMessageVideo = None                                        # type: ignore
     _HAS_MEDIA_EVENTS = False
 
 from TinyCTX.contracts import (
-    ActivationMode,
     AgentError,
     AgentThinkingChunk,
     AgentTextChunk,
@@ -105,14 +91,13 @@ from TinyCTX.contracts import (
     AgentToolResult,
     Attachment,
     content_type_for,
-    GroupPolicy,
     InboundMessage,
     Platform,
     UserIdentity,
 )
 
 if TYPE_CHECKING:
-    from TinyCTX.router import Router
+    from TinyCTX.runtime import Runtime
 
 logger = logging.getLogger(__name__)
 
@@ -131,9 +116,6 @@ DEFAULTS = {
     "prefix_required": True,
     "command_prefix": "!",
     "reset_command": "/reset",
-    "buffer_timeout_s": 0,
-    "buffer_head_lines": 2,
-    "buffer_tail_lines": 10,
     "max_reply_length": 16000,
     "sync_timeout_ms": 30000,
     "typing_indicator": True,
@@ -145,15 +127,6 @@ DEFAULTS = {
 
 # ---------------------------------------------------------------------------
 # Mention humanization
-#
-# Matrix plain-body mentions are already human-readable (@user:server), but
-# formatted bodies use HTML <a href="https://matrix.to/#/@user:server">Name</a>.
-# We normalize both to @localpart for LLM readability.
-#
-# Note: trigger detection, prefix/mention stripping, and non-trigger
-# buffering are handled by GroupLane in router.py via GroupPolicy.
-# This bridge only needs to humanize HTML anchor mentions before passing
-# the raw text down (Matrix-specific formatting concern).
 # ---------------------------------------------------------------------------
 
 _MATRIX_HTML_MENTION = re.compile(
@@ -164,23 +137,15 @@ _MATRIX_PLAIN_MXID = re.compile(r"@[\w\-.]+:[\w\-.]+")
 
 
 def _humanize_matrix_mentions(text: str, own_mxid: str) -> str:
-    """
-    Normalize Matrix mention formats to @localpart for LLM readability.
-    - HTML anchor mentions -> @localpart (from the MXID in href)
-    - Full MXIDs (@user:server) -> @localpart
-    The bot's own MXID is stripped entirely (it's the trigger, not context).
-    """
-    # Strip HTML anchor mentions, replacing with @localpart.
+    """Normalize Matrix mention formats to @localpart for LLM readability."""
     def _replace_html(m: re.Match) -> str:
-        mxid = m.group(1)           # e.g. @alice:matrix.org
+        mxid = m.group(1)
         if mxid == own_mxid:
             return ""
         return f"@{mxid.split(':')[0].lstrip('@')}"
 
     text = _MATRIX_HTML_MENTION.sub(_replace_html, text)
 
-    # Normalize remaining plain MXIDs (@user:server -> @localpart),
-    # stripping the bot's own MXID.
     def _replace_plain(m: re.Match) -> str:
         mxid = m.group(0)
         if mxid == own_mxid:
@@ -189,6 +154,63 @@ def _humanize_matrix_mentions(text: str, own_mxid: str) -> str:
 
     text = _MATRIX_PLAIN_MXID.sub(_replace_plain, text)
     return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Trigger detection (bridge-local, mirrors Discord's _is_group_trigger)
+# ---------------------------------------------------------------------------
+
+def _is_group_trigger(text: str, own_mxid: str, localpart: str,
+                      prefix: str, prefix_required: bool) -> bool:
+    """Return True if this group message should trigger an agent response."""
+    if not prefix_required:
+        return True
+    if prefix and text.startswith(prefix):
+        return True
+    if own_mxid and own_mxid in text:
+        return True
+    if localpart and f"@{localpart}" in text:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Cursor store
+# ---------------------------------------------------------------------------
+
+class CursorStore:
+    """Persists matrix.json under workspace/cursors/."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._cursors: dict[str, str] = self._load()
+
+    def _load(self) -> dict[str, str]:
+        if self._path.exists():
+            try:
+                return json.loads(self._path.read_text(encoding="utf-8"))
+            except Exception:
+                logger.warning("Matrix: corrupt cursor file %s — starting fresh", self._path)
+        return {}
+
+    def _save(self) -> None:
+        try:
+            self._path.write_text(
+                json.dumps(self._cursors, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            logger.exception("Matrix: failed to save cursor file %s", self._path)
+
+    def get(self, key: str) -> str | None:
+        return self._cursors.get(key)
+
+    def set(self, key: str, node_id: str) -> None:
+        self._cursors[key] = node_id
+        self._save()
+
+    def delete(self, key: str) -> None:
+        self._cursors.pop(key, None)
+        self._save()
 
 
 # ---------------------------------------------------------------------------
@@ -225,55 +247,59 @@ class _ReplyAccumulator:
 
 
 # ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
+def _make_session_node(db, cursor_key: str) -> str:
+    root = db.get_root()
+    node = db.add_node(parent_id=root.id, role="system", content=f"session:{cursor_key}")
+    return node.id
+
+
+# ---------------------------------------------------------------------------
 # Bridge
 # ---------------------------------------------------------------------------
 
 class MatrixBridge:
-    def __init__(self, router: "Router", options: dict) -> None:
-        self._router = router
+    def __init__(self, runtime: "Runtime", options: dict) -> None:
+        self._runtime = runtime
         self._opts = {**DEFAULTS, **options}
 
-        self._homeserver: str = str(self._opts["homeserver"])
-        self._username: str = str(self._opts["username"])
-        self._max_len: int = int(self._opts["max_reply_length"])
-        self._prefix: str = str(self._opts["command_prefix"])
+        self._homeserver: str  = str(self._opts["homeserver"])
+        self._username: str    = str(self._opts["username"])
+        self._max_len: int     = int(self._opts["max_reply_length"])
+        self._prefix: str      = str(self._opts["command_prefix"])
         self._prefix_required: bool = bool(self._opts["prefix_required"])
-        self._reset_command: str = str(self._opts["reset_command"])
-        self._dm_enabled: bool = bool(self._opts["dm_enabled"])
-        self._room_ids: set[str] = set(self._opts["room_ids"])
-        self._sync_timeout: int = int(self._opts["sync_timeout_ms"])
-        self._typing: bool = bool(self._opts["typing_indicator"])
+        self._reset_command: str    = str(self._opts["reset_command"])
+        self._dm_enabled: bool      = bool(self._opts["dm_enabled"])
+        self._room_ids: set[str]    = set(self._opts["room_ids"])
+        self._sync_timeout: int     = int(self._opts["sync_timeout_ms"])
+        self._typing: bool           = bool(self._opts["typing_indicator"])
         self._typing_on_thinking: bool = bool(self._opts["typing_on_thinking"])
-        self._typing_on_tools: bool = bool(self._opts["typing_on_tools"])
-        self._typing_on_reply: bool = bool(self._opts["typing_on_reply"])
-        self._buffer_timeout_s:  float = float(self._opts["buffer_timeout_s"])
-        self._buffer_head_lines: int   = int(self._opts["buffer_head_lines"])
-        self._buffer_tail_lines: int   = int(self._opts["buffer_tail_lines"])
+        self._typing_on_tools: bool    = bool(self._opts["typing_on_tools"])
+        self._typing_on_reply: bool    = bool(self._opts["typing_on_reply"])
 
-        raw_allowed: list = self._opts["allowed_users"]
-        self._allowed_users: set[str] = {str(u) for u in raw_allowed}
+        self._allowed_users: set[str] = {str(u) for u in self._opts["allowed_users"]}
+        self._admin_users:   set[str] = {str(u) for u in self._opts["admin_users"]}
 
-        raw_admin: list = self._opts["admin_users"]
-        self._admin_users: set[str] = {str(u) for u in raw_admin}
-
-        workspace = str(router.config.workspace.path)
+        workspace = str(self._opts.get("workspace", runtime.config.workspace.path))
         raw_store = str(self._opts["store_path"])
-        self._store_path = raw_store if os.path.isabs(raw_store) else os.path.join(workspace, raw_store)
+        self._store_path = raw_store if os.path.isabs(raw_store) \
+            else os.path.join(str(runtime.config.workspace.path), raw_store)
         os.makedirs(self._store_path, exist_ok=True)
 
         # node_id → _ReplyAccumulator
         self._accumulators: dict[str, _ReplyAccumulator] = {}
-        # node_id → asyncio.Event signalling typing should be active
+        # node_id → asyncio.Event signalling typing activity
         self._typing_active: dict[str, asyncio.Event] = {}
         # sender+room_id → pending Attachments (media arrives before text in Matrix)
         self._pending_attachments: dict[str, list[Attachment]] = {}
 
         # Persisted cursor store
-        workspace   = Path(router._config.workspace.path).expanduser().resolve()
-        cursors_dir = workspace / "cursors"
+        ws_path     = Path(runtime.config.workspace.path).expanduser().resolve()
+        cursors_dir = ws_path / "cursors"
         cursors_dir.mkdir(parents=True, exist_ok=True)
-        self._cursor_file: Path = cursors_dir / "matrix.json"
-        self._cursors: dict[str, str] = self._load_cursors()
+        self._store = CursorStore(cursors_dir / "matrix.json")
 
         self._client: AsyncClient | None = None
         self._own_user_id: str = ""
@@ -283,23 +309,11 @@ class MatrixBridge:
     # ------------------------------------------------------------------
 
     def _resolve_permission_level(self, room: MatrixRoom, sender: str) -> int:
-        """
-        Resolve a Matrix sender's permission level (0-100) from their room power level.
-
-        Config (under bridges.matrix.options):
-          default_permission: 25
-          power_level_map:       # Matrix power level -> our level
-            100: 100
-            50:  50
-            0:   25
-        """
         default   = int(self._opts.get("default_permission", 25))
         level_map = self._opts.get("power_level_map", {})
         if not level_map:
             return default
-        # Get the sender's Matrix power level in this room.
         power = room.power_levels.get_user_level(sender) if hasattr(room, "power_levels") else 0
-        # Exact match first, then nearest lower key.
         int_map = {int(k): int(v) for k, v in level_map.items()}
         if power in int_map:
             return int_map[power]
@@ -322,26 +336,31 @@ class MatrixBridge:
     def _display_name(self, room: MatrixRoom, sender: str) -> str:
         return room.user_name(sender) or sender.split(":")[0].lstrip("@")
 
-    def _build_group_policy(self) -> GroupPolicy:
-        """Build the GroupPolicy for this room from bridge config."""
-        localpart = self._username.split(":")[0].lstrip("@")
-        activation = ActivationMode.ALWAYS if not self._prefix_required else ActivationMode.MENTION
-        return GroupPolicy(
-            activation=activation,
-            trigger_prefix=self._prefix,
-            bot_mxid=self._username,
-            bot_localpart=localpart,
-            buffer_timeout_s=self._buffer_timeout_s,
-            buffer_head_lines=self._buffer_head_lines,
-            buffer_tail_lines=self._buffer_tail_lines,
-        )
+    def _localpart(self) -> str:
+        return self._username.split(":")[0].lstrip("@")
 
     # ------------------------------------------------------------------
-    # Event handler registered with Router
+    # Cursor management
+    # ------------------------------------------------------------------
+
+    def _get_or_create_cursor(self, cursor_key: str) -> str:
+        node_id = self._store.get(cursor_key)
+        if not node_id:
+            node_id = _make_session_node(self._runtime.db, cursor_key)
+            self._store.set(cursor_key, node_id)
+            logger.info("Matrix: created cursor %s -> %s", cursor_key, node_id)
+        return node_id
+
+    def _advance_cursor(self, cursor_key: str, new_tail: str) -> None:
+        if new_tail and new_tail != self._store.get(cursor_key):
+            self._store.set(cursor_key, new_tail)
+
+    # ------------------------------------------------------------------
+    # Event handler registered with Runtime
     # ------------------------------------------------------------------
 
     async def handle_event(self, event) -> None:
-        node_id = event.lane_node_id
+        node_id = event.tail_node_id
         acc = self._accumulators.get(node_id)
         if acc is None:
             logger.debug("Matrix: received event for unknown cursor %s", node_id)
@@ -357,6 +376,7 @@ class MatrixBridge:
                 typing_ev.set()
             acc.feed(event.text)
         elif isinstance(event, AgentTextFinal):
+            acc._final_tail = event.tail_node_id
             acc.finish(event.text)
         elif isinstance(event, AgentToolCall):
             if typing_ev and self._typing_on_tools:
@@ -371,14 +391,14 @@ class MatrixBridge:
             acc.error(event.message)
 
     # ------------------------------------------------------------------
-    # nio message callback
+    # nio message callbacks
     # ------------------------------------------------------------------
 
     async def _on_message(self, room: MatrixRoom, event: RoomMessageText) -> None:
         if event.sender == self._own_user_id:
             return
 
-        # Ignore replayed history from before startup.
+        # Drop replayed history from before startup.
         age_ms = getattr(event, "server_timestamp", 0)
         now_ms = int(time.time() * 1000)
         if age_ms and (now_ms - age_ms) > 60_000:
@@ -389,35 +409,30 @@ class MatrixBridge:
             return
 
         is_dm = self._is_dm_room(room)
-
         if is_dm and not self._dm_enabled:
             return
-
         if self._room_ids and room.room_id not in self._room_ids:
             return
 
         body = event.body.strip()
 
-        # ----------------------------------------------------------------
-        # DM path
-        # ----------------------------------------------------------------
+        # ── DM path ───────────────────────────────────────────────────
         if is_dm:
             att_key     = f"{event.sender}:{room.room_id}"
             attachments = tuple(self._pending_attachments.pop(att_key, []))
             cursor_key  = f"dm:{event.sender}"
             node_id     = self._get_or_create_cursor(cursor_key)
 
-            # Slash commands in DMs go through the module registry.
             if body.startswith("/"):
                 ctx = {
                     "room":    room,
                     "event":   event,
                     "bridge":  self,
-                    "router":  self._router,
+                    "runtime": self._runtime,
                     "cursor":  node_id,
                     "send":    self._send,
                 }
-                handled = await self._router.commands.dispatch(body, ctx)
+                handled = await self._runtime.commands.dispatch(body, ctx)
                 if handled:
                     return
 
@@ -435,6 +450,7 @@ class MatrixBridge:
                 timestamp=time.time(),
                 attachments=attachments,
                 permission_level=self._resolve_permission_level(room, event.sender),
+                trigger=True,
             )
             acc = _ReplyAccumulator(self._max_len)
             self._accumulators[node_id] = acc
@@ -443,17 +459,14 @@ class MatrixBridge:
             )
             return
 
-        # ----------------------------------------------------------------
-        # Group room path
-        # ----------------------------------------------------------------
+        # ── Group room path ───────────────────────────────────────────
         cursor_key = f"group:{room.room_id}"
 
-        # /reset — admin only (handled before routing)
+        # /reset — admin only
         if body == self._reset_command:
             if self._is_admin(event.sender):
-                node_id = self._cursors.get(cursor_key)
-                if node_id:
-                    self._router.reset_lane(node_id)
+                new_node_id = _make_session_node(self._runtime.db, cursor_key)
+                self._store.set(cursor_key, new_node_id)
                 await self._send(room.room_id, "✅ Session reset.")
                 logger.info(
                     "Matrix: group room %s reset by admin %s",
@@ -463,29 +476,33 @@ class MatrixBridge:
                 await self._send(room.room_id, "⛔ Only admins can reset the session.")
             return
 
-        # Slash commands (module registry) — dispatched before trigger gating.
+        # Module slash commands — before trigger gating
         if body.startswith("/"):
             node_id = self._get_or_create_cursor(cursor_key)
             ctx = {
-                "room":   room,
-                "event":  event,
-                "bridge": self,
-                "router": self._router,
-                "cursor": node_id,
-                "send":   self._send,
+                "room":    room,
+                "event":   event,
+                "bridge":  self,
+                "runtime": self._runtime,
+                "cursor":  node_id,
+                "send":    self._send,
             }
-            handled = await self._router.commands.dispatch(body, ctx)
+            handled = await self._runtime.commands.dispatch(body, ctx)
             if handled:
                 return
 
-        # Humanize HTML mention markup (Matrix-specific formatting only).
-        # Trigger detection and stripping are handled by GroupLane via GroupPolicy.
+        # Humanize HTML mention markup (Matrix-specific formatting only)
         humanized_body = _humanize_matrix_mentions(body, self._own_user_id)
 
         display     = self._display_name(room, event.sender)
         att_key     = f"{event.sender}:{room.room_id}"
         attachments = tuple(self._pending_attachments.pop(att_key, []))
         node_id     = self._get_or_create_cursor(cursor_key)
+
+        is_trigger = _is_group_trigger(
+            humanized_body, self._own_user_id, self._localpart(),
+            self._prefix, self._prefix_required,
+        )
 
         author = UserIdentity(
             platform=Platform.MATRIX,
@@ -500,9 +517,17 @@ class MatrixBridge:
             message_id=event.event_id,
             timestamp=time.time(),
             attachments=attachments,
-            group_policy=self._build_group_policy(),
+            server_name=None,
+            channel_name=getattr(room, "display_name", None) or room.room_id,
             permission_level=self._resolve_permission_level(room, event.sender),
+            trigger=is_trigger,
         )
+
+        if not is_trigger:
+            # Persist the non-trigger node; Runtime.push() handles it.
+            await self._runtime.push(msg)
+            return
+
         acc = _ReplyAccumulator(self._max_len)
         self._accumulators[node_id] = acc
         asyncio.create_task(
@@ -510,7 +535,7 @@ class MatrixBridge:
         )
 
     async def _on_media(self, room: MatrixRoom, event) -> None:
-        """Buffer media attachments — Matrix sends these as separate events from text."""
+        """Buffer media attachments — Matrix sends these separately from text."""
         if event.sender == self._own_user_id:
             return
         if not self._is_allowed(event.sender):
@@ -572,40 +597,6 @@ class MatrixBridge:
             except Exception:
                 pass
 
-    @staticmethod
-    def _load_cursors_from(path: Path) -> dict[str, str]:
-        if path.exists():
-            try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                logger.warning("Matrix: corrupt cursor file %s — starting fresh", path)
-        return {}
-
-    def _load_cursors(self) -> dict[str, str]:
-        return self._load_cursors_from(self._cursor_file)
-
-    def _save_cursors(self) -> None:
-        try:
-            self._cursor_file.write_text(
-                json.dumps(self._cursors, indent=2), encoding="utf-8"
-            )
-        except Exception:
-            logger.exception("Matrix: failed to save cursor file %s", self._cursor_file)
-
-    def _get_or_create_cursor(self, cursor_key: str) -> str:
-        """Return the node_id for a cursor_key, creating it in the DB if new."""
-        if cursor_key in self._cursors:
-            return self._cursors[cursor_key]
-        from TinyCTX.db import ConversationDB
-        workspace   = Path(self._router._config.workspace.path).expanduser().resolve()
-        db          = ConversationDB(workspace / "agent.db")
-        root        = db.get_root()
-        node        = db.add_node(parent_id=root.id, role="system", content=f"session:{cursor_key}")
-        self._cursors[cursor_key] = node.id
-        self._save_cursors()
-        logger.info("Matrix: created cursor %s -> %s", cursor_key, node.id)
-        return node.id
-
     async def _handle_turn(
         self,
         msg: InboundMessage,
@@ -615,11 +606,11 @@ class MatrixBridge:
         cursor_key: str | None = None,
     ) -> None:
         done_event = asyncio.Event()
-        typing_ev = asyncio.Event()
+        typing_ev  = asyncio.Event()
         self._typing_active[node_id] = typing_ev
 
         try:
-            accepted = await self._router.push(msg)
+            accepted = await self._runtime.push(msg)
             if not accepted:
                 await self._send(room_id, "⏳ I'm busy — please try again in a moment.")
                 return
@@ -640,14 +631,11 @@ class MatrixBridge:
             for chunk in chunks:
                 await self._send(room_id, chunk)
 
-            # Advance cursor after a successful turn.
             if cursor_key:
-                lane = self._router._lane_router._lanes.get(node_id)
-                if lane:
-                    new_id = lane.loop._tail_node_id
-                    if new_id and new_id != self._cursors.get(cursor_key):
-                        self._cursors[cursor_key] = new_id
-                        self._save_cursors()
+                new_tail = getattr(acc, "_final_tail", None)
+                if new_tail:
+                    self._advance_cursor(cursor_key, new_tail)
+
         except Exception:
             logger.exception("Matrix: error handling turn for cursor %s", node_id)
         finally:
@@ -709,11 +697,12 @@ class MatrixBridge:
                 self._reset_command,
             )
 
-        self._router.register_platform_handler(Platform.MATRIX.value, self.handle_event)
+        self._runtime.register_platform_handler(Platform.MATRIX.value, self.handle_event)
 
         client.add_event_callback(self._on_message, RoomMessageText)
         if _HAS_MEDIA_EVENTS:
-            for media_cls in (RoomMessageImage, RoomMessageFile, RoomMessageAudio, RoomMessageVideo):
+            for media_cls in (RoomMessageImage, RoomMessageFile,
+                              RoomMessageAudio, RoomMessageVideo):
                 client.add_event_callback(self._on_media, media_cls)
         else:
             logger.warning(
@@ -734,9 +723,9 @@ class MatrixBridge:
 # Loader entrypoint (called by main.py)
 # ---------------------------------------------------------------------------
 
-async def run(router: "Router") -> None:
+async def run(runtime: "Runtime") -> None:
     """Entry point called by main.py bridge loader."""
-    bridge_cfg = router.config.bridges.get("matrix")
+    bridge_cfg = runtime.config.bridges.get("matrix")
     options: dict = bridge_cfg.options if bridge_cfg else {}
-    bridge = MatrixBridge(router, options)
+    bridge = MatrixBridge(runtime, options)
     await bridge.run()
