@@ -44,15 +44,9 @@ class Runtime:
         self._tasks: set[asyncio.Task] = set()
         self._abort_events: dict[str, asyncio.Event] = {}
 
-        # Global hooks registered by modules
-        self._post_turn_hooks: list[Callable[[str], Awaitable[None]]] = []
-
     async def start(self) -> None:
         self.module_registry.load_modules(self)
         logger.info("Runtime started")
-
-    def register_background_hook(self, fn: Callable[[str], Awaitable[None]]) -> None:
-        self._post_turn_hooks.append(fn)
 
     # ------------------------------------------------------------------
     # Entry Point: push()
@@ -129,13 +123,6 @@ class Runtime:
                 # Stream events back to handlers
                 async for event in agent.run(node_id, permission_level, abort_event):
                     await self._dispatch_event(node_id, event)
-                
-                # Execute post-turn hooks (e.g. memory consolidation)
-                for hook in self._post_turn_hooks:
-                    try:
-                        await hook(agent.context.tail_node_id)
-                    except Exception:
-                        logger.exception("Post-turn hook failed")
                         
             except Exception:
                 logger.exception("Cycle failed for node %s", node_id)

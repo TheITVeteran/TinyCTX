@@ -456,6 +456,10 @@ class DiscordBridge:
         self._accumulators:  dict[str, _ReplyAccumulator] = {}
         self._typing_active: dict[str, asyncio.Event]     = {}
         self._tasks:         set[asyncio.Task]            = set()  # strong refs, prevent GC
+        # Maps any tail_node_id seen in events back to the original cursor node_id
+        # under which the accumulator was registered in _accumulators.
+        # Populated by _handle_turn; each new node_id yielded by events is added here.
+        self._tail_to_cursor: dict[str, str] = {}
         # Monotonically-increasing reset counter per cursor_key.
         # _advance_cursor checks this so a post-reset turn can't re-advance
         # the cursor after it has been rewound by /reset.
@@ -855,35 +859,19 @@ class DiscordBridge:
     # ------------------------------------------------------------------
 
     async def handle_event(self, event) -> None:
-        node_id = event.tail_node_id
-        # tail_node_id advances as nodes are written — find acc by original node_id.
-        # Walk accumulators to find one whose node_id is an ancestor of tail.
-        # Simple approach: the accumulator was registered under the original cursor node_id,
-        # which is now a parent. Use the node_id the bridge registered under.
-        # Since Runtime dispatches to the cursor handler we registered, and we registered
-        # under the original node_id, look for an acc whose key is a prefix of the current tail.
-        # Simplest: Runtime calls the platform handler with the original cursor node_id.
-        # We register under original node_id in handle_event; Runtime stores node_platforms
-        # keyed by original node_id, so event.tail_node_id won't match directly after
-        # the first node is written. Use the first acc whose key matches any prefix of the path.
-        # Pragmatic fix: _accumulators is keyed by the node_id passed to _handle_turn,
-        # which is the cursor anchor. Runtime dispatches platform events to the handler
-        # registered for that platform. Since all Discord events go to the same platform
-        # handler, we match by finding the accumulator whose trace_id matches.
-        # Simplest correct approach: keep a mapping of trace_id -> cursor node_id.
-        # For now, use the one active accumulator if there's only one, else match by
-        # the original cursor node_id stored as a back-ref on the acc.
-        acc = None
-        for key, candidate in self._accumulators.items():
-            if getattr(candidate, "_node_id", None) == node_id or key == node_id:
-                acc = candidate
-                node_id = key  # use the registration key for typing_ev lookup
-                break
-        if acc is None and len(self._accumulators) == 1:
-            node_id, acc = next(iter(self._accumulators.items()))
+        # Resolve which accumulator owns this event.
+        # event.tail_node_id advances as DB nodes are written — look it up
+        # in _tail_to_cursor which maps every node_id we've seen to the
+        # original cursor node_id under which the accumulator is registered.
+        event_tail = event.tail_node_id
+        cursor_node_id = self._tail_to_cursor.get(event_tail, event_tail)
+        acc = self._accumulators.get(cursor_node_id)
 
-        # AgentOutboundFiles is fired outside the normal turn flow — the
-        # accumulator may or may not be present. Look up the channel directly.
+        # Register any new tail_node_id we see so future events resolve correctly.
+        if cursor_node_id not in self._tail_to_cursor:
+            self._tail_to_cursor[event_tail] = cursor_node_id
+
+        # AgentOutboundFiles is fired outside the normal turn flow.
         if isinstance(event, AgentOutboundFiles):
             channel = acc.channel if acc is not None else None
             if channel is None:
@@ -897,10 +885,10 @@ class DiscordBridge:
             return
 
         if acc is None:
-            logger.debug("Discord: received event for unknown cursor %s", node_id)
+            logger.debug("Discord: received event for unknown cursor %s (tail=%s)", cursor_node_id, event_tail)
             return
 
-        typing_ev = self._typing_active.get(node_id)
+        typing_ev = self._typing_active.get(cursor_node_id)
 
         if isinstance(event, AgentThinkingChunk):
             if typing_ev and self._typing_on_thinking:
@@ -909,17 +897,21 @@ class DiscordBridge:
             if typing_ev and self._typing_on_reply:
                 typing_ev.set()
             acc.feed(event.text)
+            # Keep tail map updated as new nodes arrive.
+            self._tail_to_cursor[event_tail] = cursor_node_id
         elif isinstance(event, AgentTextFinal):
-            acc._final_tail = event.tail_node_id  # stash for cursor advance
+            acc._final_tail = event.tail_node_id
+            self._tail_to_cursor[event.tail_node_id] = cursor_node_id
             acc.finish(event.text)
         elif isinstance(event, AgentToolCall):
             if typing_ev and self._typing_on_tools:
                 typing_ev.set()
-            logger.debug("Discord: tool call %s for cursor %s", event.tool_name, node_id)
+            logger.debug("Discord: tool call %s for cursor %s", event.tool_name, cursor_node_id)
         elif isinstance(event, AgentToolResult):
+            self._tail_to_cursor[event_tail] = cursor_node_id
             logger.debug(
                 "Discord: tool result %s (%s) for cursor %s",
-                event.tool_name, "error" if event.is_error else "ok", node_id,
+                event.tool_name, "error" if event.is_error else "ok", cursor_node_id,
             )
         elif isinstance(event, AgentError):
             acc.error(event.message)
@@ -1226,6 +1218,9 @@ class DiscordBridge:
             typing_ev  = asyncio.Event()
             self._accumulators[node_id]  = acc
             self._typing_active[node_id] = typing_ev
+            # Seed the tail→cursor map so the first event resolves even before
+            # any node_id advancement has been observed.
+            self._tail_to_cursor[node_id] = node_id
 
             try:
                 accepted = await self._runtime.push(msg)
@@ -1266,6 +1261,10 @@ class DiscordBridge:
                 done_event.set()
                 self._accumulators.pop(node_id, None)
                 self._typing_active.pop(node_id, None)
+                # Remove all tail_to_cursor entries that pointed at this cursor.
+                stale = [k for k, v in self._tail_to_cursor.items() if v == node_id]
+                for k in stale:
+                    self._tail_to_cursor.pop(k, None)
 
     # ------------------------------------------------------------------
     # Entry point

@@ -9,7 +9,7 @@ from typing import AsyncIterator
 from TinyCTX.contracts import (
     AgentError, AgentEvent, AgentTextChunk, AgentTextFinal,
     AgentThinkingChunk, AgentToolCall, AgentToolResult,
-    InboundMessage, ToolCall, ToolResult, IMAGE_BLOCK_PREFIX
+    ToolCall, ToolResult, IMAGE_BLOCK_PREFIX
 )
 from TinyCTX.context import Context, HistoryEntry, HOOK_PRE_ASSEMBLE_ASYNC
 from TinyCTX.ai import LLM, TextDelta, ThinkingDelta, ToolCallAssembled, LLMError
@@ -28,6 +28,11 @@ class AgentCycle:
         self.module_registry = module_registry
         self.trace_id = str(uuid.uuid4())
         
+        # Post-turn hooks registered by modules via register_agent.
+        # Called by runtime after run() completes, with the final tail_node_id.
+        # Signature: async (tail_node_id: str) -> None
+        self.post_turn_hooks: list = []
+
         # Resources initialized during .run()
         self.db = None
         self.context = None
@@ -90,7 +95,7 @@ class AgentCycle:
         # Tracker for metadata yielded in events
         meta = {
             "trace_id": self.trace_id,
-            "message_id": "synthetic",
+            "reply_to_message_id": "synthetic",
             "tail_node_id": node_id
         }
 
@@ -113,9 +118,16 @@ class AgentCycle:
             messages, _ = self.context.assemble(tools=tools)
 
             # Inference with Fallback logic
-            text_chunks, tool_calls_list, error = await self._perform_inference(
-                messages, tools, model_chain, abort_event, meta
-            )
+            text_chunks, tool_calls_list, error = [], [], None
+            async for _ev in self._stream_inference(messages, tools, model_chain, abort_event):
+                if isinstance(_ev, tuple):
+                    # sentinel: (_chunks, _calls, _error)
+                    text_chunks, tool_calls_list, error = _ev
+                elif isinstance(_ev, AgentThinkingChunk):
+                    yield AgentThinkingChunk(text=_ev.text, **meta)
+                elif isinstance(_ev, AgentTextChunk):
+                    streaming_active = True
+                    yield AgentTextChunk(text=_ev.text, **meta)
 
             if error:
                 yield AgentError(message=f"[LLM error: {error}]", **meta)
@@ -141,8 +153,12 @@ class AgentCycle:
                 result = await self._execute_tool(tc)
                 
                 if is_last_cycle:
-                    result.output = "[Tool Limit Reached] Summarize now."
-                    result.is_error = True
+                    result = ToolResult(
+                        call_id=result.call_id,
+                        tool_name=result.tool_name,
+                        output="[Tool Limit Reached] Summarize now.",
+                        is_error=True,
+                    )
 
                 self.context.add(HistoryEntry.tool_result(result))
                 meta["tail_node_id"] = self.context.tail_node_id
@@ -157,6 +173,14 @@ class AgentCycle:
 
         yield AgentTextFinal(text=final_text if not streaming_active else "", **meta)
 
+        # Fire post-turn hooks registered by modules via register_agent.
+        final_tail = meta["tail_node_id"]
+        for hook in self.post_turn_hooks:
+            try:
+                await hook(final_tail)
+            except Exception:
+                logger.exception("[agent] post-turn hook '%s' raised", getattr(hook, '__name__', hook))
+
     # --- Internal Helpers ---
 
     def _build_llm(self, mc) -> LLM:
@@ -168,30 +192,46 @@ class AgentCycle:
             temperature=mc.temperature,
         )
 
-    async def _perform_inference(self, messages, tools, model_chain, abort_event, meta):
-        """Walks the model chain until success or exhaustion."""
+    async def _stream_inference(self, messages, tools, model_chain, abort_event):
+        """
+        Async generator that yields raw AgentTextChunk / AgentThinkingChunk events
+        (with placeholder ids — caller re-stamps them with current meta) as they
+        stream, then yields a single tuple sentinel at the end:
+            (chunks: list[str], tool_calls: list[ToolCall], error: str | None)
+        The caller unpacks the tuple to get the final result.
+        """
         for model_name in model_chain:
             llm = self.models[model_name]
-            chunks, calls, error = [], [], None
+            chunks: list[str] = []
+            calls: list[ToolCall] = []
+            error: str | None = None
 
             async for ev in llm.stream(messages, tools=tools):
-                if abort_event.is_set(): return [], [], "aborted"
-                
+                if abort_event.is_set():
+                    yield ([], [], "aborted")
+                    return
+
                 if isinstance(ev, ThinkingDelta):
-                    yield AgentThinkingChunk(text=ev.text, **meta)
+                    yield AgentThinkingChunk(text=ev.text,
+                                             tail_node_id="", trace_id="",
+                                             reply_to_message_id="")
                 elif isinstance(ev, TextDelta):
                     chunks.append(ev.text)
-                    yield AgentTextChunk(text=ev.text, **meta)
+                    yield AgentTextChunk(text=ev.text,
+                                         tail_node_id="", trace_id="",
+                                         reply_to_message_id="")
                 elif isinstance(ev, ToolCallAssembled):
                     calls.append(ToolCall(ev.call_id, ev.tool_name, ev.args))
                 elif isinstance(ev, LLMError):
                     error = ev.message
                     break
-            
-            if not error: return chunks, calls, None
+
+            if not error:
+                yield (chunks, calls, None)
+                return
             logger.warning("Model %s failed: %s", model_name, error)
-        
-        return [], [], error
+
+        yield ([], [], error)
 
     async def _execute_tool(self, call: ToolCall) -> ToolResult:
         proxy = {
