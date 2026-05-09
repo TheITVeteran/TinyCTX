@@ -39,7 +39,7 @@ from pathlib import Path
 
 from TinyCTX.contracts import (
     InboundMessage, ContentType, UserIdentity, Platform,
-    AgentTextFinal, AgentError
+    AgentTextChunk, AgentTextFinal, AgentError
 )
 
 logger = logging.getLogger(__name__)
@@ -52,42 +52,6 @@ _HEARTBEAT_AUTHOR  = UserIdentity(
 )
 _TOKEN = "HEARTBEAT_OK"
 
-
-# ---------------------------------------------------------------------------
-# Cursor bootstrap
-# ---------------------------------------------------------------------------
-
-def _get_or_create_cursor(agent, branch_from: str) -> tuple[str, str]:
-    """
-    Return (lane_node_id, tail_node_id) for the heartbeat branch.
-    Both ids are stored on the agent instance so subsequent calls return cached values.
-    """
-    attr_lane = "_heartbeat_lane_node_id"
-    attr_tail = "_heartbeat_cursor_node_id"
-    if getattr(agent, attr_lane, None):
-        return getattr(agent, attr_lane), getattr(agent, attr_tail)
-
-    from TinyCTX.db import ConversationDB
-    workspace = Path(agent.config.workspace.path).expanduser().resolve()
-    db        = ConversationDB(workspace / "agent.db")
-
-    if branch_from == "session":
-        parent_id = agent._tail_node_id
-    else:
-        parent_id = db.get_root().id
-
-    node = db.add_node(
-        parent_id=parent_id,
-        role="system",
-        content="session:heartbeat",
-    )
-    setattr(agent, attr_lane, node.id)
-    setattr(agent, attr_tail, node.id)
-    logger.info(
-        "[heartbeat] created branch cursor %s (branch_from=%s, parent=%s)",
-        node.id, branch_from, parent_id,
-    )
-    return node.id, node.id
 
 class _HeartbeatRunner:
     def __init__(self, runtime, cfg: dict) -> None:
@@ -116,59 +80,75 @@ class _HeartbeatRunner:
             await asyncio.sleep(self.interval_secs)
 
     async def _tick(self):
-        # 1. Determine Parent (Root vs Session Branching)
+        # 1. Determine starting cursor
         if not self.cursor_node_id:
-            if self.cfg.get("branch_from") == "session":
-                # Note: 'session' branching in a multi-user environment 
-                # usually implies a specific thread. Here we default to Root 
-                # if no specific session is provided to the runner.
-                self.cursor_node_id = self.runtime.db.get_root().id
-            else:
-                self.cursor_node_id = self.runtime.db.get_root().id
+            self.cursor_node_id = self.runtime.db.get_root().id
 
-        # 2. Continuation Loop
-        current_prompt = self.cfg.get("prompt", "If nothing needs attention, reply HEARTBEAT_OK.")
-        
-        for turn in range(int(self.cfg.get("max_continuations", 5))):
+        # 2. Continuation loop
+        current_prompt = self.cfg.get("prompt", "Read HEARTBEAT.md if it exists. If nothing needs attention, reply HEARTBEAT_OK.")
+
+        for _turn in range(int(self.cfg.get("max_continuations", 5))):
             msg = InboundMessage(
                 tail_node_id=self.cursor_node_id,
                 author=_HEARTBEAT_AUTHOR,
+                content_type=ContentType.TEXT,
                 text=current_prompt,
-                trigger=True
+                message_id=f"heartbeat-{time.time()}",
+                timestamp=time.time(),
+                trigger=True,
             )
 
-            reply_event = asyncio.Event()
-            full_text = []
+            reply_queue: asyncio.Queue = asyncio.Queue()
+            new_node_id = await self.runtime.push(msg, reply_queue=reply_queue)
 
-            async def _collect(ev):
-                if isinstance(ev, AgentTextFinal):
-                    if ev.text: full_text.append(ev.text)
-                    reply_event.set()
-                elif isinstance(ev, AgentError):
-                    reply_event.set()
+            full_text: list[str] = []
+            final_tail: str | None = None
+            timed_out = False
 
-            # Push and Listen
-            new_node_id = await self.runtime.push(msg)
-            self.runtime._cursor_handlers[new_node_id] = _collect
-            
             try:
-                await asyncio.wait_for(reply_event.wait(), timeout=120)
-                # Advance cursor to the assistant's reply
-                assistant_node = self.runtime.db.get_child_of(new_node_id)
-                self.cursor_node_id = assistant_node.id if assistant_node else new_node_id
-                
-                # Parse Reply
-                reply_content = "".join(full_text).strip()
-                is_ok, alert = _parse_reply(reply_content, int(self.cfg.get("ack_max_chars", 300)))
-                
-                if is_ok:
-                    break # Heartbeat satisfied
-                
-                logger.warning("[HEARTBEAT ALERT]\n%s", alert)
-                current_prompt = self.cfg.get("continuation_prompt", "Continue...")
-                
-            finally:
-                self.runtime._cursor_handlers.pop(new_node_id, None)
+                while True:
+                    try:
+                        event = await asyncio.wait_for(reply_queue.get(), timeout=120)
+                    except asyncio.TimeoutError:
+                        logger.warning("[heartbeat] turn timed out")
+                        timed_out = True
+                        break
+
+                    if event is None:  # sentinel
+                        break
+
+                    if isinstance(event, AgentTextFinal):
+                        if event.text:
+                            full_text.append(event.text)
+                        final_tail = event.tail_node_id
+                    elif isinstance(event, AgentTextChunk):
+                        full_text.append(event.text)
+                    elif isinstance(event, AgentError):
+                        logger.error("[heartbeat] agent error: %s", event.message)
+                        timed_out = True
+                        break
+            except Exception:
+                logger.exception("[heartbeat] error draining reply queue")
+                break
+
+            if timed_out:
+                break
+
+            # Advance cursor to the real assistant tail
+            if final_tail:
+                self.cursor_node_id = final_tail
+            else:
+                self.cursor_node_id = new_node_id
+
+            # Parse reply
+            reply_content = "".join(full_text).strip()
+            is_ok, alert = _parse_reply(reply_content, int(self.cfg.get("ack_max_chars", 300)))
+
+            if is_ok:
+                break
+
+            logger.warning("[HEARTBEAT ALERT]\n%s", alert)
+            current_prompt = self.cfg.get("continuation_prompt", "Continue the task, or reply HEARTBEAT_OK when done.")
 
     def _in_active_window(self) -> bool:
         hours = self.cfg.get("active_hours")
@@ -234,11 +214,6 @@ def _parse_reply(reply: str, ack_max: int) -> tuple[bool, str]:
         matched = True
     return matched and len(text) <= ack_max, text
 
-
-def _emit_alert(text: str) -> None:
-    logger.warning("[HEARTBEAT ALERT]\n%s", text)
-
-
 # ---------------------------------------------------------------------------
 # Active hours
 # ---------------------------------------------------------------------------
@@ -246,20 +221,3 @@ def _emit_alert(text: str) -> None:
 def _parse_hhmm(s: str) -> dtime:
     h, m = s.strip().split(":")
     return dtime(int(h), int(m))
-
-
-def _in_active_window(active_hours: dict | None) -> bool:
-    if not active_hours:
-        return True
-    try:
-        start = _parse_hhmm(active_hours["start"])
-        end_  = _parse_hhmm(active_hours["end"])
-    except (KeyError, ValueError):
-        logger.warning("[heartbeat] invalid active_hours config — running anyway")
-        return True
-    if start == end_:
-        return False
-    now = datetime.now().time().replace(second=0, microsecond=0)
-    if start < end_:
-        return start <= now < end_
-    return now >= start or now < end_

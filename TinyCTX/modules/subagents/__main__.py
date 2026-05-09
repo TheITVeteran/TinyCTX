@@ -4,6 +4,13 @@ import json
 
 from TinyCTX.modules.subagents.subagents import spawn_subagent, wait_for_subagent
 
+_runtime = None
+
+
+def register_runtime(runtime) -> None:
+    global _runtime
+    _runtime = runtime
+
 
 def register_agent(agent) -> None:
     if getattr(agent, "is_subagent", False):
@@ -36,8 +43,13 @@ def register_agent(agent) -> None:
             return json.dumps(
                 {"status": "error", "error": "spawn_agent requires a non-empty prompt."}
             )
+        if _runtime is None:
+            return json.dumps(
+                {"status": "error", "error": "Runtime not available — subagents not initialised."}
+            )
         payload = await spawn_subagent(
             agent,
+            _runtime,
             prompt,
             max_concurrent=max_concurrent,
             completed_ttl_seconds=completed_ttl_seconds,

@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any
 
 from TinyCTX.contracts import (
+    AgentError, AgentTextFinal,
     InboundMessage, ContentType,
     UserIdentity, Platform,
 )
@@ -434,12 +435,10 @@ class _CronRunner:
         logger.info("[cron] running job '%s' (reset=%s)", job.name, job.reset_after_run)
         start_ms = _now_ms()
 
-        # 1. Determine the starting point (the Parent)
+        # 1. Determine the starting cursor
         if job.reset_after_run or not job.cursor_node_id:
-            # Fork from root (Stateless)
             parent_id = self.runtime.db.get_root().id
         else:
-            # Continue the existing branch (Stateful)
             parent_id = job.cursor_node_id
 
         # 2. Prepare the turn
@@ -448,42 +447,35 @@ class _CronRunner:
             author=_CRON_AUTHOR,
             content_type=ContentType.TEXT,
             text=job.message,
-            trigger=True
+            trigger=True,
         )
 
-        reply_event = asyncio.Event()
-        
-        async def _collect(event) -> None:
-            from TinyCTX.contracts import AgentTextFinal, AgentError
-            if isinstance(event, (AgentTextFinal, AgentError)):
-                reply_event.set()
+        reply_queue: asyncio.Queue = asyncio.Queue()
 
         try:
-            # 3. Push to Runtime
-            # Returns the ID of the 'user' node just created
-            user_node_id = await self.runtime.push(msg)
-            if not user_node_id:
-                raise RuntimeError("Runtime push failed")
+            # 3. Push — returns the user node id; events stream into reply_queue
+            await self.runtime.push(msg, reply_queue=reply_queue)
 
-            self.runtime._cursor_handlers[user_node_id] = _collect
+            # 4. Drain the queue to find the final assistant tail
+            final_tail: str | None = None
+            while True:
+                try:
+                    event = await asyncio.wait_for(reply_queue.get(), timeout=300)
+                except asyncio.TimeoutError:
+                    logger.warning("[cron] job '%s' timed out", job.name)
+                    break
 
-            # 4. Wait for completion
-            await asyncio.wait_for(reply_event.wait(), timeout=300)
+                if event is None:  # sentinel — turn complete
+                    break
 
-            # 5. Advance Cursor (Crucial Step)
-            # We need to find the tail of this specific turn. 
-            # In the new architecture, AgentCycle emits the latest tail_node_id
-            # in the metadata of the AgentTextFinal event. 
-            # (Assuming your AgentCycle adds the final assistant node ID there)
-            
-            # For now, we can query the DB for the child of user_node_id 
-            # created by the assistant during this turn.
-            assistant_node = self.runtime.db.get_child_of(user_node_id)
-            if assistant_node:
-                job.cursor_node_id = assistant_node.id
-            else:
-                # Fallback to the user node if assistant didn't reply for some reason
-                job.cursor_node_id = user_node_id
+                if isinstance(event, AgentTextFinal) and event.tail_node_id:
+                    final_tail = event.tail_node_id
+                elif isinstance(event, AgentError):
+                    raise RuntimeError(event.message)
+
+            # 5. Advance cursor to real assistant tail
+            if final_tail:
+                job.cursor_node_id = final_tail
 
             job.state.last_status = "ok"
             job.state.last_error = None
@@ -492,8 +484,6 @@ class _CronRunner:
             job.state.last_status = "error"
             job.state.last_error = str(e)
             logger.error("[cron] job '%s' failed: %s", job.name, e)
-        finally:
-            self.runtime._cursor_handlers.pop(user_node_id, None)
 
         # 6. Housekeeping
         job.state.last_run_at_ms = start_ms
