@@ -395,6 +395,15 @@ class _CronRunner:
     def _save(self) -> None:
         _save_store(self._store_path, self._jobs, self._version)
 
+    def _next_wake_ms(self) -> int | None:
+        """Find the earliest next_run_at_ms among all enabled jobs."""
+        enabled_jobs = [
+            j.state.next_run_at_ms 
+            for j in self._jobs 
+            if j.enabled and j.state.next_run_at_ms is not None
+        ]
+        return min(enabled_jobs) if enabled_jobs else None
+    
     def _arm(self) -> None:
         if self._timer_task and not self._timer_task.done():
             self._timer_task.cancel()
@@ -418,7 +427,7 @@ class _CronRunner:
             async with self._job_lock:
                 await self._run_job(job)
         
-        self._save()
+        await asyncio.to_thread(self._save)
         self._arm()
 
     async def _run_job(self, job: CronJob) -> None:
