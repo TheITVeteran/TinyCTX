@@ -550,13 +550,11 @@ class DiscordBridge:
         return node_id
 
     def _advance_cursor(self, cursor_key: str, new_tail: str) -> None:
-        """Snapshot the current tail node_id for restart recovery."""
+        """Advance the live cursor and persist it for restart recovery."""
         if new_tail and new_tail != self._store.get(cursor_key):
             self._store.set(cursor_key, new_tail)
-            logger.debug(
-                "Discord: cursor %s tail snapshot %s (for restart recovery)",
-                cursor_key, new_tail,
-            )
+            self._lane_keys[cursor_key] = new_tail
+            logger.info("Discord: cursor %s advanced to %s", cursor_key, new_tail)
 
     # ------------------------------------------------------------------
     # App command sync
@@ -862,11 +860,6 @@ class DiscordBridge:
         event_tail = event.tail_node_id
         cursor_node_id = self._tail_to_cursor.get(event_tail, event_tail)
         acc = self._accumulators.get(cursor_node_id)
-        logger.debug(
-            "[discord/handle_event] %s | event_tail=%s | cursor_node_id=%s | acc=%s | accumulators=%s | tail_to_cursor=%s",
-            type(event).__name__, event_tail, cursor_node_id, acc is not None,
-            list(self._accumulators.keys()), dict(self._tail_to_cursor),
-        )
 
         # Register any new tail_node_id we see so future events resolve correctly.
         if cursor_node_id not in self._tail_to_cursor:
@@ -1220,10 +1213,6 @@ class DiscordBridge:
             self._accumulators[node_id]  = acc
             self._typing_active[node_id] = typing_ev
             self._tail_to_cursor[node_id] = node_id
-            logger.debug(
-                "[discord/_handle_turn] registered accumulator node_id=%s cursor_key=%s",
-                node_id, cursor_key,
-            )
 
             try:
                 accepted = await self._runtime.push(msg)
@@ -1234,10 +1223,6 @@ class DiscordBridge:
                 # events dispatched under that id resolve to this accumulator.
                 if isinstance(accepted, str) and accepted != node_id:
                     self._tail_to_cursor[accepted] = node_id
-                    logger.debug(
-                        "[discord/_handle_turn] seeded tail_to_cursor %s → %s",
-                        accepted, node_id,
-                    )
 
                 turn_timeout: float | None = float(self._opts.get("turn_timeout_s", 0)) or None
                 if self._typing:

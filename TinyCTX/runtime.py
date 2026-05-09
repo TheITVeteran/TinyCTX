@@ -121,7 +121,7 @@ class Runtime:
                 logger.debug("[runtime] cycle starting for node %s", node_id)
                 
                 async for event in agent.run(node_id, permission_level, abort_event):
-                    logger.debug("[runtime] dispatching event %s for node %s", type(event).__name__, node_id)
+                    # logger.debug("[runtime] dispatching event %s for node %s", type(event).__name__, node_id)
                     await self._dispatch_event(node_id, event)
                 
                 logger.debug("[runtime] cycle complete for node %s", node_id)

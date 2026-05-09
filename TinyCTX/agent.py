@@ -125,12 +125,12 @@ class AgentCycle:
                 if isinstance(_ev, tuple):
                     # sentinel: (_chunks, _calls, _error)
                     text_chunks, tool_calls_list, error = _ev
-                    logger.debug("[agent] inference done — chunks=%d tools=%d error=%s", len(text_chunks), len(tool_calls_list), error)
+                    # logger.debug("[agent] inference done — chunks=%d tools=%d error=%s", len(text_chunks), len(tool_calls_list), error)
                 elif isinstance(_ev, AgentThinkingChunk):
-                    logger.debug("[agent] thinking chunk (%d chars)", len(_ev.text))
+                    # logger.debug("[agent] thinking chunk (%d chars)", len(_ev.text))
                     yield AgentThinkingChunk(text=_ev.text, **meta)
                 elif isinstance(_ev, AgentTextChunk):
-                    logger.debug("[agent] text chunk (%d chars)", len(_ev.text))
+                    # logger.debug("[agent] text chunk (%d chars)", len(_ev.text))
                     streaming_active = True
                     yield AgentTextChunk(text=_ev.text, **meta)
 
