@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && \
     pip install \
         PyYAML aiohttp pyfiglet rich questionary requests mcp numpy \
-        tiktoken structlog tenacity ddgs pdfplumber \
+        tiktoken structlog tenacity ddgs pdfplumber ladybug\
         python-docx sympy "antlr4-python3-runtime==4.13.2" jinja2 \
         croniter "discord.py" matrix-nio
 
