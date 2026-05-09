@@ -185,7 +185,11 @@ class WorkspaceConfig:
     path: Path = field(default_factory=lambda: Path("~/.tinyctx").expanduser())
 
     def __post_init__(self):
-        self.path = Path(self.path).expanduser().resolve()  # ~ → /home/tinyctx in container, %USERPROFILE% on Windows
+        override = os.environ.get("TINYCTX_WORKSPACE_PATH", "").strip()
+        if override:
+            self.path = Path(override).resolve()
+        else:
+            self.path = Path(self.path).expanduser().resolve()  # ~ → /home/tinyctx in container, %USERPROFILE% on Windows
 
 
 @dataclass

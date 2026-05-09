@@ -39,6 +39,7 @@ services:
 
     environment:
       TINYCTX_GATEWAY_HOST: "0.0.0.0"
+      TINYCTX_WORKSPACE_PATH: /home/tinyctx
       DISCORD_BOT_TOKEN:
       MATRIX_PASSWORD:
 
