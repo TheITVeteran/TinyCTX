@@ -191,7 +191,7 @@ def write_checkpoint_if_needed(
     # If depth > threshold, writes a full checkpoint state_delta onto node_id.
 ```
 
-`AgentCycle.__init__` calls `load_session_state`, then
+`AgentCycle.__init__` calls `load_session_state`, which itself automatically calls
 `write_checkpoint_if_needed`. This logic moves out of Runtime entirely.
 
 ---
@@ -251,8 +251,6 @@ naturally by checking a condition (e.g. token delta) before spawning.
 
 ## What does NOT change
 
-- `db.py` — untouched
-- `contracts.py` — untouched  
 - `utils/tool_handler.py` — untouched
 - `utils/bm25.py` — untouched
 - `utils/attachments.py` — untouched
