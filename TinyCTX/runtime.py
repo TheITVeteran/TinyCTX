@@ -52,9 +52,12 @@ class Runtime:
     # Entry Point: push()
     # ------------------------------------------------------------------
 
-    async def push(self, msg: InboundMessage) -> str | None:
+    async def push(self, msg: InboundMessage, reply_queue: asyncio.Queue | None = None) -> str:
         """
         Accepts InboundMessage, persists to DB, and triggers AgentCycle if needed.
+        Always returns the new user node id.
+        If reply_queue is provided and msg.trigger is True, events are written into
+        it as they arrive. A None sentinel is put when the turn is complete.
         """
         # 1. Track platform for event routing — done after user node is written below.
         # 2. Persist Attachments
@@ -94,12 +97,14 @@ class Runtime:
         # Capacity Check
         if self._active >= (self._semaphore._value + self._active):
             logger.warning("Capacity reached. Node %s persisted but not triggered.", new_tail_id)
-            return None
+            if reply_queue is not None:
+                await reply_queue.put(None)
+            return new_tail_id
 
         # Spawn Task
         abort_ev = self._get_abort_event(new_tail_id)
         task = asyncio.create_task(
-            self._process(new_tail_id, msg.permission_level, abort_ev),
+            self._process(new_tail_id, msg.permission_level, abort_ev, reply_queue),
             name=f"cycle:{new_tail_id}"
         )
         self._tasks.add(task)
@@ -111,7 +116,7 @@ class Runtime:
     # Processing Logic
     # ------------------------------------------------------------------
 
-    async def _process(self, node_id: str, permission_level: int, abort_event: asyncio.Event) -> None:
+    async def _process(self, node_id: str, permission_level: int, abort_event: asyncio.Event, reply_queue: asyncio.Queue | None = None) -> None:
         from TinyCTX.agent import AgentCycle
         
         async with self._semaphore:
@@ -121,8 +126,9 @@ class Runtime:
                 logger.debug("[runtime] cycle starting for node %s", node_id)
                 
                 async for event in agent.run(node_id, permission_level, abort_event):
-                    # logger.debug("[runtime] dispatching event %s for node %s", type(event).__name__, node_id)
                     await self._dispatch_event(node_id, event)
+                    if reply_queue is not None:
+                        await reply_queue.put(event)
                 
                 logger.debug("[runtime] cycle complete for node %s", node_id)
             except Exception:
@@ -130,6 +136,8 @@ class Runtime:
             finally:
                 self._active -= 1
                 self._abort_events.pop(node_id, None)
+                if reply_queue is not None:
+                    await reply_queue.put(None)  # sentinel: turn complete
 
     # ------------------------------------------------------------------
     # Internal Helpers

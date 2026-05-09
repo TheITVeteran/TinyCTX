@@ -180,8 +180,9 @@ class AgentCycle:
                 )
 
         logger.debug("[agent] yielding AgentTextFinal, streaming_active=%s", streaming_active)
-        final_tail = meta["tail_node_id"]  # assistant tail, for post-turn hooks
-        meta["tail_node_id"] = node_id     # reset to original so bridges resolve the accumulator
+        # meta["tail_node_id"] is the real assistant tail — yield it as-is so
+        # bridges can advance their cursor to the correct node.
+        final_tail = meta["tail_node_id"]
         yield AgentTextFinal(text=final_text if not streaming_active else "", **meta)
 
         # Fire post-turn hooks registered by modules via register_agent.
