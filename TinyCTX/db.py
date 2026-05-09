@@ -17,6 +17,8 @@ ConversationDB(path)          — open (or create) the database
   .get_ancestors(node_id)     — [root, ..., node] order
   .get_children(node_id)      — direct children (unordered)
   .get_root()                 — the single global root node
+  .load_session_state(node_id, threshold) — walk delta chain, return (state, depth)
+  .write_checkpoint_if_needed(node_id, state, depth, threshold) — write checkpoint
   .close()                    — close the connection
 
 Phase 2 additions
@@ -29,6 +31,7 @@ Phase 2 additions
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import time
@@ -154,19 +157,14 @@ class ConversationDB:
 
     def ensure_schema(self) -> None:
         """Create tables, apply migrations, and insert the global root node if needed."""
-        # Run schema DDL inside an explicit transaction rather than via
-        # executescript(), which issues an implicit COMMIT first and would
-        # disable the WAL/foreign-key PRAGMAs set in __init__.
         with self._conn:
             self._conn.executescript(_SCHEMA)
-        # Apply column migrations idempotently (IF NOT EXISTS is safe to re-run).
         for stmt in _MIGRATIONS:
             try:
                 self._conn.execute(stmt)
             except sqlite3.OperationalError:
-                pass  # column already exists on SQLite versions without IF NOT EXISTS
+                pass
         self._conn.commit()
-        # Insert root node if not already present
         row = self._conn.execute("SELECT value FROM meta WHERE key = 'root_id'").fetchone()
         if row is None:
             root_id = str(uuid.uuid4())
@@ -201,16 +199,11 @@ class ConversationDB:
         attachment_paths: str | None = None,
         state_delta: str | None = None,
     ) -> Node:
-        # Validate role against the allowlist — all queries are already
-        # parameterized so there is no SQLi risk, but an invalid role would
-        # corrupt context assembly and is a sign something has gone wrong.
         if role not in _VALID_ROLES:
             raise ValueError(
                 f"ConversationDB.add_node: invalid role {role!r}. "
                 f"Must be one of {sorted(_VALID_ROLES)}."
             )
-        # parent_id must be a non-empty string — only the global root node
-        # (written by ensure_schema) is allowed to have parent_id=None.
         if not parent_id or not isinstance(parent_id, str):
             raise ValueError(
                 "ConversationDB.add_node: parent_id must be a non-empty string. "
@@ -255,14 +248,9 @@ class ConversationDB:
         """
         rows = self._conn.execute(_ANCESTORS_CTE, (node_id,)).fetchall()
         nodes = [_row_to_node(r) for r in rows]
-        # CTE walks child → root; reverse to get root → child order.
         nodes.reverse()
-        # Drop the global root (parent_id is None, role=system, content="")
-        # so it doesn't appear as an empty system turn in dialogue assembly.
         if nodes and nodes[0].parent_id is None and nodes[0].content == "":
             nodes = nodes[1:]
-        # Drop session-init nodes (role=system, content starts with "session:")
-        # — these are structural branch anchors, not dialogue content.
         nodes = [n for n in nodes if not (n.role == "system" and n.content.startswith("session:"))]
         return nodes
 
@@ -291,6 +279,69 @@ class ConversationDB:
         cur = self._conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
         self._conn.commit()
         return cur.rowcount > 0
+
+    # ------------------------------------------------------------------
+    # Session state helpers (moved from Runtime / Context)
+    # ------------------------------------------------------------------
+
+    def load_session_state(self, node_id: str) -> tuple[dict, int]:
+        """
+        Walk ancestors tip→root one hop at a time, merging state_delta JSON
+        objects to reconstruct current session state.
+
+        Stops early when it hits a node with "_checkpoint": true.
+        Calls write_checkpoint_if_needed automatically if threshold is supplied.
+
+        Returns (state_dict, depth) where depth is the number of nodes visited.
+        Keys filled by earlier (tip-side) nodes win (most-recent wins).
+        """
+        state: dict = {}
+        depth = 0
+        current_id: str | None = node_id
+
+        while current_id is not None:
+            node = self.get_node(current_id)
+            if node is None:
+                break
+            depth += 1
+
+            if node.state_delta:
+                try:
+                    delta: dict = json.loads(node.state_delta)
+                except (json.JSONDecodeError, ValueError):
+                    delta = {}
+                for k, v in delta.items():
+                    if k not in state:
+                        state[k] = v
+                if delta.get("_checkpoint"):
+                    break
+
+            if node.parent_id is None:
+                break
+            current_id = node.parent_id
+
+        state.pop("_checkpoint", None)
+        return state, depth
+
+    def write_checkpoint_if_needed(
+        self,
+        node_id: str,
+        state: dict,
+        depth: int,
+        threshold: int,
+    ) -> None:
+        """
+        If depth > threshold, write a full checkpoint state_delta onto node_id.
+        The checkpoint carries all current state keys plus "_checkpoint": true.
+        """
+        if depth <= threshold:
+            return
+
+        checkpoint: dict = {"_checkpoint": True, **state}
+        self.update_node_state_delta(node_id, json.dumps(checkpoint, ensure_ascii=False))
+        logger.debug(
+            "Checkpoint written on node %s (walk depth was %d)", node_id, depth
+        )
 
     def close(self) -> None:
         try:

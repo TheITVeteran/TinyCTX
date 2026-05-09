@@ -69,8 +69,8 @@ hook registrations, _ContextProxy, module_env.
 
 ### `AgentCycle` — self-contained (lives in `agent.py`)
 
-Constructor: `AgentCycle(node_id, permission_level, config, module_registry)`
-
+Constructor: `AgentCycle(db, config, module_registry)`
+.run: `AgentCycle.run(node_id, permission_level)`
 What it does itself:
 1. Opens `ConversationDB` from `config.workspace.path`
 2. Walks DB from `node_id` to load session state
