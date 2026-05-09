@@ -53,9 +53,6 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Exhaustive set of roles the dialogue layer is allowed to write.
-# Anything outside this set is rejected at the DB boundary so malformed
-# or injected role strings can never corrupt assembly logic.
 _VALID_ROLES = {"user", "assistant", "system", "tool"}
 
 
@@ -67,15 +64,15 @@ _VALID_ROLES = {"user", "assistant", "system", "tool"}
 class Node:
     id:               str
     parent_id:        str | None
-    role:             str            # user | assistant | system | tool
-    content:          str            # JSON if list (attachment blocks), else plain str
-    created_at:       float          # unix timestamp
-    tool_calls:       str | None     # JSON or None
-    tool_call_id:     str | None     # for tool-result nodes
-    author_id:        str | None     # stable per-platform sender id; None for DMs
-    author_name:      str | None     # display name at send time; None for DMs
-    attachment_paths: str | None     # JSON list of upload paths, or None
-    state_delta:      str | None     # JSON state-delta object, or None
+    role:             str
+    content:          str
+    created_at:       float
+    tool_calls:       str | None
+    tool_call_id:     str | None
+    author_id:        str | None
+    author_name:      str | None
+    attachment_paths: str | None
+    state_delta:      str | None
     flags:            str = "[]"     # JSON array of flag strings
 
 
@@ -109,11 +106,13 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 # Columns added after the initial schema — applied to existing DBs via ALTER TABLE.
+# Note: ALTER TABLE in SQLite does not support NOT NULL without a default, and
+# older SQLite versions reject NOT NULL in ADD COLUMN entirely. Use plain DEFAULT.
 _MIGRATIONS = [
-    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS author_name      TEXT",
-    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS attachment_paths TEXT",
-    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS state_delta      TEXT",
-    "ALTER TABLE nodes ADD COLUMN IF NOT EXISTS flags            TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE nodes ADD COLUMN author_name      TEXT",
+    "ALTER TABLE nodes ADD COLUMN attachment_paths TEXT",
+    "ALTER TABLE nodes ADD COLUMN state_delta      TEXT",
+    "ALTER TABLE nodes ADD COLUMN flags            TEXT DEFAULT '[]'",
 ]
 
 _COLS = "id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id, author_name, attachment_paths, state_delta, flags"
@@ -131,7 +130,6 @@ SELECT {cols} FROM nodes WHERE id = (
 )
 """.format(cols=_COLS)
 
-# Recursive CTE: walks from node up to root, then we reverse in Python.
 _ANCESTORS_CTE = f"""
 WITH RECURSIVE anc AS (
     SELECT {_COLS} FROM nodes WHERE id = ?
@@ -190,9 +188,9 @@ class ConversationDB:
         for stmt in _MIGRATIONS:
             try:
                 self._conn.execute(stmt)
+                self._conn.commit()
             except sqlite3.OperationalError:
-                pass
-        self._conn.commit()
+                pass  # column already exists
         row = self._conn.execute("SELECT value FROM meta WHERE key = 'root_id'").fetchone()
         if row is None:
             root_id = str(uuid.uuid4())
@@ -354,10 +352,7 @@ class ConversationDB:
         self._conn.commit()
 
     def get_nodes_without_flag(self, flag: str) -> list[Node]:
-        """
-        Return all nodes that do not have the given flag.
-        Uses a JSON search; suitable for moderate-sized DBs.
-        """
+        """Return all nodes that do not have the given flag."""
         rows = self._conn.execute(
             "SELECT " + _COLS + " FROM nodes WHERE flags NOT LIKE ?",
             (f'%"{flag}"%',),
@@ -369,7 +364,7 @@ class ConversationDB:
         Walk the parent chain from node_id upward, adding flag to each node,
         stopping at (and excluding) the first ancestor that already has the flag.
 
-        Returns the list of node_ids that were flagged (in tip → root order).
+        Returns the list of node_ids that were flagged (tip → root order).
         Returns [] if node_id itself already has the flag.
         """
         flagged: list[str] = []
@@ -381,7 +376,7 @@ class ConversationDB:
                 break
             existing = _parse_flags(node.flags)
             if flag in existing:
-                break  # stop here; don't flag this node
+                break
             existing.append(flag)
             self._conn.execute(
                 "UPDATE nodes SET flags = ? WHERE id = ?",
