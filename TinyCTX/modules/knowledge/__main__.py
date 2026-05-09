@@ -125,19 +125,25 @@ def register_agent(agent) -> None:
         if not nodes:
             return
 
-        state, _ = db.load_session_state(tail_node_id)
-        user_name = state.get("author_name") or "user"
-
-        user_text        = ""
-        asst_text        = ""
-        attachment_names: list[str] = []
-
         import json as _json
+
+        # Collect the last assistant reply and all user nodes since the previous
+        # assistant turn — preserving per-author identity for multi-user convos.
+        asst_text = ""
+        # list of (username, user_text, attachment_names) in chronological order
+        user_turns: list[tuple[str, str, list[str]]] = []
+
         for node in reversed(nodes):
             if node.role == "assistant" and not asst_text:
                 asst_text = node.content if isinstance(node.content, str) else ""
-            elif node.role == "user" and not user_text:
-                content = node.content or ""
+            elif node.role == "assistant" and asst_text:
+                # Hit the previous assistant turn — stop collecting user nodes
+                break
+            elif node.role == "user":
+                username = node.author_name or node.author_id or "user"
+                content  = node.content or ""
+                user_text: str = ""
+                attachment_names: list[str] = []
                 if isinstance(content, str) and content.startswith("["):
                     try:
                         blocks = _json.loads(content)
@@ -151,14 +157,21 @@ def register_agent(agent) -> None:
                         user_text = content
                 else:
                     user_text = content
-            if user_text and asst_text:
-                break
+                if user_text or attachment_names:
+                    user_turns.append((username, user_text.strip(), attachment_names))
 
-        if user_text or asst_text:
+        if not user_turns and not asst_text:
+            return
+
+        # Write chronologically: user turns were collected in reverse, flip them back.
+        user_turns.reverse()
+        # All user turns share the same assistant reply (written after the last user turn).
+        for i, (username, user_text, attachment_names) in enumerate(user_turns):
+            is_last = (i == len(user_turns) - 1)
             session_buffer.append_turn(
-                username=user_name,
-                user_text=user_text.strip(),
-                assistant_text=asst_text.strip(),
+                username=username,
+                user_text=user_text,
+                assistant_text=asst_text if is_last else "",
                 attachment_names=attachment_names or None,
             )
 
