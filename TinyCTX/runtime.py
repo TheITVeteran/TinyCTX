@@ -177,7 +177,10 @@ class Runtime:
         ev.clear()
         self._abort_events[node_id] = ev
         return ev
-
+    
+    def register_platform_handler(self, platform: str, handler: EventHandler) -> None:
+        self._platform_handlers.setdefault(platform, []).append(handler)
+        
     def abort(self, node_id: str) -> bool:
         if node_id in self._abort_events:
             self._abort_events[node_id].set()
