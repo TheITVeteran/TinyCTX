@@ -443,6 +443,9 @@ def apply_logging(cfg: LoggingConfig, *, level_override: str | int | None = None
         datefmt="%H:%M:%S",
     )
 
+    for _noisy in ("discord.gateway", "discord.client", "discord.http", "discord.state"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+        
     structlog.configure(
         processors=[
             structlog.stdlib.add_log_level,

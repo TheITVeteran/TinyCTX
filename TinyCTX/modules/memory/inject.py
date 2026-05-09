@@ -44,6 +44,7 @@ literal braces in markdown content aren't corrupted.
 from __future__ import annotations
 
 import datetime
+from email.mime import text
 import logging
 import re
 from pathlib import Path
@@ -63,7 +64,9 @@ def _read(path: Path) -> str | None:
     if not path.exists():
         return None
     try:
-        text = path.read_text(encoding="utf-8").strip()
+        if text is None:
+            logger.warning("[inject] prompt file missing or empty: %s", path)
+            return None
         return text or None
     except Exception as exc:
         logger.warning("[inject] could not read %s: %s", path, exc)
