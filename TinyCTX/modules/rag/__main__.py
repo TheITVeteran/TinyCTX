@@ -1,18 +1,20 @@
 """
-modules/memory/__main__.py
+modules/rag/__main__.py
 
-All wiring happens in register_agent(cycle). Singletons (store, indexer,
-embedder) are created once via module-level lazy state the first time
-register_agent is called, so concurrent AgentCycles share the same
-read-only store/indexer without re-opening files on every turn.
+RAG pipeline wiring: indexing, hybrid search, auto-inject, memory_search tool,
+and the context-nudge / consolidation hook.
 
-register_runtime is used only for the /memory consolidate command, which
-needs a reference to runtime.push and runtime.db. It does NOT register
-tools — tools are registered per-cycle in register_agent.
+Singletons (store, indexer, embedder) are created once via module-level lazy
+state on the first register_agent call, so concurrent AgentCycles share the
+same read-only store/indexer without re-opening files on every turn.
 
-The consolidation post-turn hook is appended to cycle.post_turn_hooks so
-it runs after the cycle completes. It needs runtime to call push(), so it
-captures runtime via closure from register_runtime.
+register_runtime registers the /memory consolidate command and wires the
+post-turn consolidation hook.  It does NOT register tools — tools are
+registered per-cycle in register_agent.
+
+Config is read from the memory module's EXTENSION_META defaults merged with
+workspace overrides under the "memory_search" key, keeping a single source of
+truth for all memory/rag settings.
 """
 from __future__ import annotations
 
@@ -36,7 +38,6 @@ _cfg: dict   = {}
 _workspace: Path | None = None
 
 # Consolidation hook closure — set by register_runtime if nudge is configured.
-# Called by register_agent to append onto each cycle's post_turn_hooks.
 _consolidation_hook = None
 
 
@@ -78,6 +79,19 @@ def _format_results(results: list[dict], budget_tokens: int) -> str | None:
     return "\n\n".join(parts)
 
 
+def _load_cfg(config) -> dict:
+    """Merge EXTENSION_META defaults with workspace overrides."""
+    try:
+        from TinyCTX.modules.system_prompt import EXTENSION_META
+        defaults: dict = EXTENSION_META.get("default_config", {})
+    except ImportError:
+        defaults = {}
+    overrides: dict = {}
+    if hasattr(config, "extra") and isinstance(config.extra, dict):
+        overrides = config.extra.get("memory_search", {})
+    return {**defaults, **overrides}
+
+
 # ---------------------------------------------------------------------------
 # Singleton initialization (called once from register_agent)
 # ---------------------------------------------------------------------------
@@ -91,17 +105,7 @@ def _init_singletons(config) -> None:
     workspace.mkdir(parents=True, exist_ok=True)
     _workspace = workspace
 
-    try:
-        from TinyCTX.modules.memory import EXTENSION_META
-        defaults: dict = EXTENSION_META.get("default_config", {})
-    except ImportError:
-        defaults = {}
-
-    overrides: dict = {}
-    if hasattr(config, "extra") and isinstance(config.extra, dict):
-        overrides = config.extra.get("memory_search", {})
-
-    _cfg = {**defaults, **overrides}
+    _cfg = _load_cfg(config)
 
     def _resolve(filename: str) -> Path:
         p = Path(filename)
@@ -111,7 +115,7 @@ def _init_singletons(config) -> None:
     db_path    = _resolve(_cfg["db_file"])
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    from TinyCTX.modules.memory.store import MemoryStore
+    from TinyCTX.modules.rag.store import MemoryStore
     _store = MemoryStore(db_path)
     atexit.register(_store.close)
 
@@ -119,12 +123,12 @@ def _init_singletons(config) -> None:
     if embedding_model:
         try:
             from TinyCTX.ai import Embedder
-            emb_cfg  = config.get_embedding_model(embedding_model)
+            emb_cfg   = config.get_embedding_model(embedding_model)
             _embedder = Embedder.from_config(emb_cfg)
-            logger.info("[memory] embedder: %s @ %s", emb_cfg.model, emb_cfg.base_url)
+            logger.info("[rag] embedder: %s @ %s", emb_cfg.model, emb_cfg.base_url)
         except (KeyError, ValueError) as exc:
             logger.warning(
-                "[memory] embedding_model '%s' not usable (%s) — BM25 only",
+                "[rag] embedding_model '%s' not usable (%s) — BM25 only",
                 embedding_model, exc,
             )
 
@@ -134,11 +138,11 @@ def _init_singletons(config) -> None:
         else ""
     )
 
-    from TinyCTX.modules.memory.chunkers import get_strategy
+    from TinyCTX.modules.rag.chunkers import get_strategy
     chunk_kwargs: dict = _cfg.get("chunk_kwargs") or {}
     strategy = get_strategy(_cfg["chunk_strategy"], **chunk_kwargs)
 
-    from TinyCTX.modules.memory.indexer import MemoryIndexer
+    from TinyCTX.modules.rag.indexer import MemoryIndexer
     _indexer = MemoryIndexer(
         store           = _store,
         memory_dir      = memory_dir,
@@ -149,30 +153,19 @@ def _init_singletons(config) -> None:
 
     _initialized = True
     logger.info(
-        "[memory] singletons ready — dir: %s | db: %s | strategy: %s | embedder: %s",
+        "[rag] singletons ready — dir: %s | db: %s | strategy: %s | embedder: %s",
         memory_dir, db_path, _cfg["chunk_strategy"], model_name_str or "BM25 only",
     )
 
 
 # ---------------------------------------------------------------------------
-# register_runtime — command registration only
+# register_runtime — consolidation command + post-turn hook
 # ---------------------------------------------------------------------------
 
 def register_runtime(runtime) -> None:
     global _consolidation_hook
 
-    # We need config to read nudge settings but can't call _init_singletons
-    # here (no cycle yet). Read config directly.
-    try:
-        from TinyCTX.modules.memory import EXTENSION_META
-        defaults: dict = EXTENSION_META.get("default_config", {})
-    except ImportError:
-        defaults = {}
-    overrides: dict = {}
-    if hasattr(runtime.config, "extra") and isinstance(runtime.config.extra, dict):
-        overrides = runtime.config.extra.get("memory_search", {})
-    cfg = {**defaults, **overrides}
-
+    cfg             = _load_cfg(runtime.config)
     nudge_threshold = float(cfg.get("nudge_threshold", 0.80))
     nudge_message   = cfg.get("nudge_message", "")
     token_limit     = runtime.config.context
@@ -211,17 +204,16 @@ def register_runtime(runtime) -> None:
                 json.dumps({"memory_nudge_tokens_at_last": tokens_now}),
             )
             logger.info(
-                "[memory] consolidation spawned off tail=%s (delta %d/%d tokens)",
+                "[rag] consolidation spawned off tail=%s (delta %d/%d tokens)",
                 tail_node_id, tokens_now - tokens_at_nudge, nudge_delta,
             )
 
         _consolidation_hook = _hook
         logger.info(
-            "[memory] consolidation hook configured — threshold %.0f%% delta (%d tokens)",
+            "[rag] consolidation hook configured — threshold %.0f%% delta (%d tokens)",
             nudge_threshold * 100, nudge_delta,
         )
 
-        # /memory consolidate command
         async def _cmd_consolidate(args: list[str], context: dict) -> None:
             import time as _time, datetime
             from TinyCTX.contracts import InboundMessage, ContentType, UserIdentity, Platform
@@ -230,11 +222,11 @@ def register_runtime(runtime) -> None:
             tail    = context.get("tail_node_id")
             if not tail:
                 if console:
-                    console.print(f"[{c('error')}]  ✗  memory: no active session[/{c('error')}]")
+                    console.print(f"[{c('error')}]  ✗  rag: no active session[/{c('error')}]")
                 return
             date_str = datetime.date.today().strftime("%d-%m-%Y")
             msg_text = nudge_message.format(date=date_str)
-            opening = runtime.db.add_node(parent_id=tail, role="user", content=msg_text)
+            opening  = runtime.db.add_node(parent_id=tail, role="user", content=msg_text)
             await runtime.push(InboundMessage(
                 tail_node_id=opening.id,
                 author=UserIdentity(platform=Platform.SYSTEM, user_id="system", username="system"),
@@ -253,69 +245,29 @@ def register_runtime(runtime) -> None:
             help="Spawn a memory consolidation branch immediately",
         )
     else:
-        logger.info("[memory] consolidation disabled")
+        logger.info("[rag] consolidation disabled")
 
 
 # ---------------------------------------------------------------------------
-# register_agent — all per-cycle wiring
+# register_agent — RAG wiring per cycle
 # ---------------------------------------------------------------------------
 
 def register_agent(cycle) -> None:
-    # Initialize singletons on first call.
     _init_singletons(cycle.config)
 
-    cfg          = _cfg
-    store        = _store
-    indexer      = _indexer
-    embedder     = _embedder
-    workspace    = _workspace
-    budget_tokens = int(cfg["memory_budget_tokens"])
-    top_k         = int(cfg["top_k"])
-    bm25_weight   = float(cfg["bm25_weight"])
+    cfg                 = _cfg
+    store               = _store
+    indexer             = _indexer
+    embedder            = _embedder
+    budget_tokens       = int(cfg["memory_budget_tokens"])
+    top_k               = int(cfg["top_k"])
+    bm25_weight         = float(cfg["bm25_weight"])
     decay_halflife_days = float(cfg.get("decay_halflife_days", 30.0))
     decay_weight        = float(cfg.get("decay_weight", 0.0))
     auto_inject         = bool(cfg["auto_inject"])
     ms_vis = str(cfg.get("tools", {}).get("memory_search", "always_on")).lower().strip()
 
-    def _resolve(filename: str) -> Path:
-        p = Path(filename)
-        return p if p.is_absolute() else workspace / p
-
-    soul_path   = _resolve(cfg["soul_file"])
-    agents_path = _resolve(cfg["agents_file"])
-    memory_path = _resolve(cfg["memory_file"])
-    tools_path  = _resolve(cfg["tools_file"])
-
-    from TinyCTX.modules.memory.inject import MacroResolver, make_provider
-    resolver = MacroResolver()
-
-    # 1. Static prompt providers
-    cycle.context.register_prompt(
-        "soul",
-        make_provider(soul_path, workspace, extra_macros=resolver),
-        role="system",
-        priority=int(cfg["soul_priority"]),
-    )
-    cycle.context.register_prompt(
-        "agents",
-        make_provider(agents_path, workspace, extra_macros=resolver),
-        role="system",
-        priority=int(cfg["agents_priority"]),
-    )
-    cycle.context.register_prompt(
-        "memory",
-        make_provider(memory_path, workspace, extra_macros=resolver),
-        role="system",
-        priority=int(cfg["memory_priority"]),
-    )
-    cycle.context.register_prompt(
-        "tools",
-        make_provider(tools_path, workspace, extra_macros=resolver),
-        role="system",
-        priority=int(cfg["tools_priority"]),
-    )
-
-    # 2. Async pre-assemble hook — ephemeral results shared via closure
+    # 1. Async pre-assemble hook — ephemeral results shared via closure
     results: list = []
 
     async def _pre_assemble_async(ctx) -> None:
@@ -359,7 +311,7 @@ def register_agent(cycle) -> None:
             try:
                 q_vec = await embedder.embed_one(query)
             except Exception as exc:
-                logger.warning("[memory] embed failed: %s — BM25 only", exc)
+                logger.warning("[rag] embed failed: %s — BM25 only", exc)
 
         found = store.hybrid_search(
             query, q_vec, top_k, bm25_weight,
@@ -368,11 +320,11 @@ def register_agent(cycle) -> None:
         )
         results[:] = found
         if found:
-            logger.debug("[memory] '%s…' → %d result(s)", query[:40], len(found))
+            logger.debug("[rag] '%s…' → %d result(s)", query[:40], len(found))
 
     cycle.context.register_hook(HOOK_PRE_ASSEMBLE_ASYNC, _pre_assemble_async, priority=0)
 
-    # 3. Auto-inject prompt
+    # 2. Auto-inject prompt
     if auto_inject:
         cycle.context.register_prompt(
             "memory_search",
@@ -381,7 +333,7 @@ def register_agent(cycle) -> None:
             priority=int(cfg["search_priority"]),
         )
 
-    # 4. memory_search tool
+    # 3. memory_search tool
     async def memory_search(query: str) -> str:
         """
         Search the memory store for information relevant to a query.
@@ -397,7 +349,7 @@ def register_agent(cycle) -> None:
             try:
                 q_vec = await embedder.embed_one(query)
             except Exception as exc:
-                logger.warning("[memory] tool embed failed: %s — BM25 only", exc)
+                logger.warning("[rag] tool embed failed: %s — BM25 only", exc)
         found = store.hybrid_search(
             query, q_vec, top_k, bm25_weight,
             decay_halflife_days=decay_halflife_days,
@@ -414,6 +366,6 @@ def register_agent(cycle) -> None:
             min_permission=25,
         )
 
-    # 5. Post-turn consolidation hook (if configured by register_runtime)
+    # 4. Post-turn consolidation hook (if configured by register_runtime)
     if _consolidation_hook is not None:
         cycle.post_turn_hooks.append(_consolidation_hook)

@@ -1,22 +1,12 @@
 EXTENSION_META = {
-    "name":    "memory",
+    "name":    "rag",
     "version": "2.1",
     "description": (
-        "Injects workspace markdown files (SOUL.md, AGENTS.md, MEMORY.md) as "
-        "system prompt providers, and provides hybrid BM25+vector search over "
-        "all *.md files under workspace/memory/ via an async pre-assemble hook "
-        "and an explicit memory_search tool."
+        "Hybrid BM25+vector search index over *.md files under workspace/memory/. "
+        "Provides a memory_search tool and an auto-inject system prompt block. "
+        "Load alongside modules/system_prompt, which handles static prompt injection."
     ),
     "default_config": {
-        # --- Static prompt files (read fresh every turn) ---
-        "soul_file":    "SOUL.md",
-        "agents_file":  "AGENTS.md",
-        "memory_file":  "MEMORY.md",
-        "tools_file":   "TOOLS.md",
-        "soul_priority":   0,
-        "agents_priority": 10,
-        "memory_priority": 20,
-        "tools_priority": 15,
         # --- Search index ---
         # Directory scanned recursively for *.md files, relative to workspace
         "memory_dir": "memory",

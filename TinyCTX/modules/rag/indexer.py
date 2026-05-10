@@ -1,5 +1,5 @@
 """
-modules/memory/indexer.py
+modules/rag/indexer.py
 
 Async indexer — walks workspace/memory/**/*.md, detects dirty files via
 MemoryStore.is_dirty(), re-chunks and re-embeds them, then commits to the store.
@@ -7,7 +7,7 @@ MemoryStore.is_dirty(), re-chunks and re-embeds them, then commits to the store.
 Design notes
 ------------
 - Fully async: embedding calls go through ai.Embedder (aiohttp).
-- Lazy: sync() is a no-op until called. The pre_assemble hook in __main__.py
+- Lazy: sync() is a no-op until called. The pre_assemble hook in memory/__main__.py
   calls sync() before every retrieval, so the first turn triggers indexing.
 - Embedder is optional: if None (no embedding model configured), chunks are
   stored without vectors and only BM25 search is available.
@@ -18,10 +18,10 @@ Design notes
 Public API
 ----------
     indexer = MemoryIndexer(
-        store          = store,           # MemoryStore instance
-        memory_dir     = Path("~/.tinyctx/memory"),
-        strategy       = get_strategy("markdown"),
-        embedder       = embedder_or_none,
+        store           = store,           # MemoryStore instance
+        memory_dir      = Path("~/.tinyctx/memory"),
+        strategy        = get_strategy("markdown"),
+        embedder        = embedder_or_none,
         embedding_model = "nomic-embed-text",  # model name string for dirty check
     )
     await indexer.sync()   # call before every retrieval
@@ -33,8 +33,8 @@ import hashlib
 import logging
 from pathlib import Path
 
-from TinyCTX.modules.memory.store import MemoryStore
-from TinyCTX.modules.memory.chunkers import ChunkStrategy
+from TinyCTX.modules.rag.store import MemoryStore
+from TinyCTX.modules.rag.chunkers import ChunkStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ class MemoryIndexer:
 
     async def _sync_inner(self) -> None:
         if not self._memory_dir.exists():
-            logger.debug("[memory/indexer] memory_dir does not exist yet: %s", self._memory_dir)
+            logger.debug("[rag/indexer] memory_dir does not exist yet: %s", self._memory_dir)
             return
 
         # Collect all .md files recursively
@@ -91,7 +91,7 @@ class MemoryIndexer:
         # Remove rows for files that were deleted from disk
         removed = self._store.remove_deleted_files(disk_paths)
         if removed:
-            logger.info("[memory/indexer] removed %d deleted file(s) from index", len(removed))
+            logger.info("[rag/indexer] removed %d deleted file(s) from index", len(removed))
             self._store.commit()
 
         # Index dirty files
@@ -104,23 +104,23 @@ class MemoryIndexer:
                 if self._store.is_dirty(path_str, content_hash, self._embedding_model):
                     dirty.append((path, content, content_hash))
             except Exception as exc:
-                logger.warning("[memory/indexer] could not read %s: %s", path, exc)
+                logger.warning("[rag/indexer] could not read %s: %s", path, exc)
 
         if not dirty:
-            logger.debug("[memory/indexer] all files up to date (%d total)", len(disk_paths))
+            logger.debug("[rag/indexer] all files up to date (%d total)", len(disk_paths))
             return
 
-        logger.info("[memory/indexer] indexing %d dirty file(s)", len(dirty))
+        logger.info("[rag/indexer] indexing %d dirty file(s)", len(dirty))
         for path, content, content_hash in dirty:
             await self._index_file(path, content, content_hash)
 
     async def _index_file(self, path: Path, content: str, content_hash: str) -> None:
         path_str = str(path.resolve())
-        mtime        = path.stat().st_mtime
-        chunks       = self._strategy.chunk(content)
+        mtime    = path.stat().st_mtime
+        chunks   = self._strategy.chunk(content)
 
         if not chunks:
-            logger.debug("[memory/indexer] no chunks produced for %s — skipping", path.name)
+            logger.debug("[rag/indexer] no chunks produced for %s — skipping", path.name)
             return
 
         # Embed chunks if an embedder is configured
@@ -130,7 +130,7 @@ class MemoryIndexer:
                 embeddings = await self._embedder.embed(chunks)
             except Exception as exc:
                 logger.warning(
-                    "[memory/indexer] embedding failed for %s: %s — storing without vectors",
+                    "[rag/indexer] embedding failed for %s: %s — storing without vectors",
                     path.name, exc,
                 )
 
@@ -142,7 +142,7 @@ class MemoryIndexer:
 
         vec_status = f"{len(embeddings)} vectors" if embeddings is not None else "no vectors (BM25 only)"
         logger.info(
-            "[memory/indexer] indexed %s — %d chunk(s), %s",
+            "[rag/indexer] indexed %s — %d chunk(s), %s",
             path.name, len(chunks), vec_status,
         )
 

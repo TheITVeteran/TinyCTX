@@ -1,7 +1,7 @@
 """
-modules/memory/store.py
+modules/rag/store.py
 
-SQLite-backed chunk store for the memory module.
+SQLite-backed chunk store for the rag module.
 
 Responsibilities:
   - Schema creation and migration
@@ -389,7 +389,7 @@ class MemoryStore:
                 results = self._apply_decay(results, decay_halflife_days, decay_weight)
             return results
 
-        # Load all vectors (blobs) for cosine scoring — also fetch mtime via join
+        # Load all vectors (blobs) for cosine scoring
         all_blob_rows = self._conn.execute(
             """
             SELECT c.id, c.file_path, c.text, c.embedding
