@@ -43,13 +43,15 @@ logger = logging.getLogger(__name__)
 # Module-level singleton state — initialized once on first register_agent call
 # ---------------------------------------------------------------------------
 
-_initialized    = False
-_stores:  dict  = {}   # name -> DataStore
-_indexers: dict = {}   # name -> DataBankIndexer
-_databanks: dict = {}  # name -> DataBank
-_embedder       = None
-_cfg: dict      = {}
+_initialized     = False
+_stores:  dict   = {}   # name -> DataStore
+_indexers: dict  = {}   # name -> DataBankIndexer
+_databanks: dict = {}   # name -> DataBank
+_embedder        = None
+_cfg: dict       = {}
 _workspace: Path | None = None
+_strategy        = None
+_model_name_str  = ""
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +134,7 @@ async def _do_rag_search(
 # ---------------------------------------------------------------------------
 
 def _init_singletons(config) -> None:
-    global _initialized, _stores, _indexers, _databanks, _embedder, _cfg, _workspace
+    global _initialized, _embedder, _cfg, _workspace, _strategy, _model_name_str
 
     if _initialized:
         return
@@ -143,28 +145,23 @@ def _init_singletons(config) -> None:
 
     _cfg = _load_cfg(config)
 
-    def _resolve(rel: str) -> Path:
-        p = Path(rel)
-        return p if p.is_absolute() else workspace / p
-
-    rag_dir   = _resolve(_cfg["rag_dir"])
-    cache_dir = _resolve(_cfg["cache_dir"])
+    cache_dir = _resolve_path(_cfg["cache_dir"], workspace)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     extensions: set[str] = {
         ext.lower() if ext.startswith(".") else f".{ext.lower()}"
         for ext in _cfg.get("indexed_extensions", [".md", ".txt", ".rst"])
     }
+    _cfg["_extensions"] = extensions  # stash for _sync_discovery
 
     # Embedder (optional)
     embedding_model = _cfg.get("embedding_model", "").strip()
-    model_name_str  = ""
     if embedding_model:
         try:
             from TinyCTX.ai import Embedder
-            emb_cfg   = config.get_embedding_model(embedding_model)
-            _embedder = Embedder.from_config(emb_cfg)
-            model_name_str = (
+            emb_cfg      = config.get_embedding_model(embedding_model)
+            _embedder    = Embedder.from_config(emb_cfg)
+            _model_name_str = (
                 config.models[embedding_model].model
                 if embedding_model in config.models
                 else ""
@@ -179,36 +176,63 @@ def _init_singletons(config) -> None:
     # Chunking strategy
     from TinyCTX.modules.rag.chunkers import get_strategy
     chunk_kwargs: dict = _cfg.get("chunk_kwargs") or {}
-    strategy = get_strategy(_cfg["chunk_strategy"], **chunk_kwargs)
+    _strategy = get_strategy(_cfg["chunk_strategy"], **chunk_kwargs)
 
-    # Discover databanks
+    _initialized = True
+    logger.info(
+        "[rag] ready — strategy: %s | embedder: %s",
+        _cfg["chunk_strategy"], _model_name_str or "BM25 only",
+    )
+
+    # Initial discovery
+    _sync_discovery()
+
+
+def _resolve_path(rel: str, workspace: Path) -> Path:
+    p = Path(rel)
+    return p if p.is_absolute() else workspace / p
+
+
+def _sync_discovery() -> None:
+    """Re-scan the rag directory and register any new databanks. Idempotent."""
+    global _databanks, _stores, _indexers
+
+    rag_dir   = _resolve_path(_cfg["rag_dir"], _workspace)
+    cache_dir = _resolve_path(_cfg["cache_dir"], _workspace)
+    extensions: set[str] = _cfg["_extensions"]
+
     from TinyCTX.modules.rag.databanks import discover_databanks
-    _databanks = discover_databanks(rag_dir, extensions)
-    logger.info("[rag] discovered %d databank(s): %s", len(_databanks), list(_databanks))
-
-    # Build one store + indexer per databank
     from TinyCTX.modules.rag.store import DataStore
     from TinyCTX.modules.rag.indexer import DataBankIndexer
 
-    for name, bank in _databanks.items():
+    current = discover_databanks(rag_dir, extensions)
+
+    for name, bank in current.items():
+        if name in _databanks:
+            continue  # already registered
         db_path = cache_dir / f"{name}.db"
         store   = DataStore(db_path)
         indexer = DataBankIndexer(
             store           = store,
             databank        = bank,
-            strategy        = strategy,
+            strategy        = _strategy,
             embedder        = _embedder,
-            embedding_model = model_name_str,
+            embedding_model = _model_name_str,
         )
-        _stores[name]   = store
-        _indexers[name] = indexer
+        _databanks[name] = bank
+        _stores[name]    = store
+        _indexers[name]  = indexer
         atexit.register(store.close)
+        logger.info("[rag] registered databank '%s' (%s)", name, bank.kind)
 
-    _initialized = True
-    logger.info(
-        "[rag] ready — dir: %s | strategy: %s | embedder: %s",
-        rag_dir, _cfg["chunk_strategy"], model_name_str or "BM25 only",
-    )
+    removed = set(_databanks) - set(current)
+    for name in removed:
+        logger.info("[rag] databank '%s' removed from disk", name)
+        _stores.pop(name, None)
+        _indexers.pop(name, None)
+        _databanks.pop(name, None)
+
+    logger.debug("[rag] discovery complete — %d databank(s) active", len(_databanks))
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +275,8 @@ def register_agent(cycle) -> None:
         targets: list[str] = state.get("rag_auto_targets") or []
         if not targets:
             return
+
+        _sync_discovery()
 
         # Extract last user message text
         query = ""
@@ -327,6 +353,7 @@ def register_agent(cycle) -> None:
             return "[rag_search error: targets must be a non-empty list of databank names]"
 
         k = int(max_results) if max_results and int(max_results) > 0 else top_k
+        _sync_discovery()
 
         unknown = [t for t in targets if t not in _stores]
         if unknown:
