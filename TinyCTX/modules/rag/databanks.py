@@ -16,6 +16,21 @@ Public API
   LoreBookDataBank(name, path)
   discover_databanks(rag_dir, extensions) -> dict[str, DataBank]
       Scan workspace/rag/ and return all valid databanks by name.
+
+Retrieval interface
+-------------------
+Each DataBank implements two async retrieval methods that __main__ dispatches
+to directly — no isinstance checks or kind-branching needed there:
+
+  await bank.rag_search(query, store, embedder, top_k, bm25_weight)
+      Full embedding/BM25 search. Used by the rag_search tool.
+      FilesDataBank: hybrid search against the index.
+      LoreBookDataBank: hybrid search against the per-entry index.
+
+  bank.auto_inject(text)
+      Fast, synchronous retrieval for the pre-assemble hook.
+      FilesDataBank: not supported, returns [].
+      LoreBookDataBank: ST-style keyword matching, no index needed.
 """
 from __future__ import annotations
 
@@ -23,7 +38,10 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Iterator, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Iterator, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from TinyCTX.modules.rag.store import DataStore
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +71,24 @@ class DataBank(Protocol):
         Yield (path_str, text_content) for each indexable item.
         path_str is a stable, unique string key used by the store (e.g. absolute path).
         text_content is the full text to chunk and index.
+        """
+        ...
+
+    async def rag_search(
+        self,
+        query: str,
+        store: "DataStore",
+        embedder,
+        top_k: int,
+        bm25_weight: float,
+    ) -> list[dict]:
+        """Run a hybrid BM25+vector search and return result dicts."""
+        ...
+
+    def auto_inject(self, text: str) -> list[dict]:
+        """
+        Synchronous retrieval for the pre-assemble hook.
+        Returns result dicts {file, path, text, score}, or [] if not supported.
         """
         ...
 
@@ -99,6 +135,21 @@ class FilesDataBank:
                 logger.warning("[rag/databanks] skipping %s: %s", path, exc)
                 continue
             yield str(path.resolve()), content
+
+    async def rag_search(
+        self,
+        query: str,
+        store: "DataStore",
+        embedder,
+        top_k: int,
+        bm25_weight: float,
+    ) -> list[dict]:
+        """Hybrid BM25+vector search against this bank's index."""
+        return await _hybrid_search(self._name, query, store, embedder, top_k, bm25_weight)
+
+    def auto_inject(self, text: str) -> list[dict]:
+        """FilesDataBank does not support synchronous keyword injection."""
+        return []
 
     def __repr__(self) -> str:
         return f"FilesDataBank({self._name!r}, root={self._root})"
@@ -198,14 +249,31 @@ class LoreBookDataBank:
             path_key = f"{self._path}::{uid}"
             yield path_key, text
 
-    # -- set_auto_rag_databanks path ------------------------------------------
+    async def rag_search(
+        self,
+        query: str,
+        store: "DataStore",
+        embedder,
+        top_k: int,
+        bm25_weight: float,
+    ) -> list[dict]:
+        """Hybrid BM25+vector search against the per-entry index."""
+        return await _hybrid_search(self._name, query, store, embedder, top_k, bm25_weight)
 
-    def keyword_match(self, text: str) -> list[str]:
+    def auto_inject(self, text: str) -> list[dict]:
+        """ST-style keyword matching — no index needed."""
+        return [
+            {"file": self._name, "path": str(self._path), "text": content, "score": 1.0}
+            for content in self._keyword_match(text)
+            if content
+        ]
+
+    def _keyword_match(self, text: str) -> list[str]:
         """
         Return content strings for all entries whose keywords match `text`.
         Follows SillyTavern selectiveLogic from world-info.js:33-38.
         """
-        results = []
+        results: list[str] = []
         for entry in self._entries:
             if entry.get("disable", False):
                 continue
@@ -302,6 +370,48 @@ class LoreBookDataBank:
 
 
 # ---------------------------------------------------------------------------
+# Shared retrieval helper
+# ---------------------------------------------------------------------------
+
+async def _hybrid_search(
+    bank_name: str,
+    query: str,
+    store: "DataStore",
+    embedder,
+    top_k: int,
+    bm25_weight: float,
+) -> list[dict]:
+    """Run hybrid BM25+vector search against `store`. Used by both bank types."""
+    q_vec = None
+    if embedder is not None:
+        try:
+            q_vec = await embedder.embed_one(query)
+        except Exception as exc:
+            logger.warning("[rag/databanks] embed failed for '%s': %s — BM25 only", bank_name, exc)
+    try:
+        return store.hybrid_search(query, q_vec, top_k, bm25_weight)
+    except Exception as exc:
+        logger.warning("[rag/databanks] search failed for '%s': %s", bank_name, exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Lorebook validation
+# ---------------------------------------------------------------------------
+
+def _is_lorebook_json(path: Path) -> bool:
+    """
+    Return True if `path` looks like a SillyTavern lorebook JSON.
+    Minimal check: valid JSON with a top-level 'entries' key that is a dict or list.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return isinstance(raw.get("entries"), (dict, list))
+
+
+# ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
 
@@ -310,10 +420,11 @@ def discover_databanks(rag_dir: Path, extensions: set[str]) -> dict[str, "DataBa
     Scan `rag_dir` and return a dict of {name: DataBank} for all valid sources.
 
     Rules:
-      - A subdirectory of rag_dir   -> FilesDataBank named after the folder.
-      - A *.json file in rag_dir    -> LoreBookDataBank named after the stem.
-      - Other files at root level   -> ignored.
-      - rag_dir doesn't exist yet   -> returns empty dict (no error).
+      - A subdirectory of rag_dir              -> FilesDataBank named after the folder.
+      - A *.json that passes lorebook validation -> LoreBookDataBank named after the stem.
+      - A *.json that fails validation           -> warning logged, skipped.
+      - Other files at root level               -> debug logged, ignored.
+      - rag_dir doesn't exist yet              -> returns empty dict (no error).
 
     The .cache directory is always excluded.
     """
@@ -332,8 +443,18 @@ def discover_databanks(rag_dir: Path, extensions: set[str]) -> dict[str, "DataBa
             logger.debug("[rag/databanks] discovered FilesDataBank: %s", entry.name)
 
         elif entry.is_file() and entry.suffix.lower() == ".json":
-            bank = LoreBookDataBank(name=entry.stem, path=entry)
-            result[entry.stem] = bank
-            logger.debug("[rag/databanks] discovered LoreBookDataBank: %s", entry.stem)
+            if _is_lorebook_json(entry):
+                bank = LoreBookDataBank(name=entry.stem, path=entry)
+                result[entry.stem] = bank
+                logger.debug("[rag/databanks] discovered LoreBookDataBank: %s", entry.stem)
+            else:
+                logger.warning(
+                    "[rag/databanks] skipping %s — not a recognised lorebook JSON "
+                    "(expected top-level 'entries' dict or list)",
+                    entry.name,
+                )
+
+        elif entry.is_file():
+            logger.debug("[rag/databanks] ignoring %s — not a directory or .json", entry.name)
 
     return result

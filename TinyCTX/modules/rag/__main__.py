@@ -19,10 +19,9 @@ Databank layout (workspace/rag/):
     my_world.json    <- LoreBookDataBank "my_world"
     .cache/          <- SQLite DBs, one per databank (excluded from discovery)
 
-Auto-inject strategy by databank kind:
-    files    — hybrid BM25+vector search against the last user message
-    lorebook — SillyTavern keyword matching (keyword_match) against the last
-               user message; matched entries are injected verbatim
+Retrieval is dispatched through the DataBank protocol:
+    rag_search tool   -> await bank.rag_search(query, store, embedder, top_k, bm25_weight)
+    pre-assemble hook -> bank.auto_inject(text)  [synchronous]
 
 Config is read from EXTENSION_META defaults merged with workspace overrides
 under the "rag" key in the workspace config.
@@ -108,57 +107,24 @@ def _format_results(
     return "\n\n".join(parts)
 
 
-async def _search_databank(
+async def _do_rag_search(
     name: str,
     query: str,
     top_k: int,
     bm25_weight: float,
 ) -> list[dict]:
-    """Sync the named databank and run a hybrid search. Returns [] on any error."""
+    """Sync the indexer then dispatch to bank.rag_search. Returns [] on any error."""
+    bank    = _databanks.get(name)
     store   = _stores.get(name)
     indexer = _indexers.get(name)
-    if store is None or indexer is None:
+    if bank is None or store is None or indexer is None:
         return []
     try:
         await indexer.sync()
     except Exception as exc:
         logger.warning("[rag] sync failed for '%s': %s", name, exc)
         return []
-
-    q_vec = None
-    if _embedder is not None:
-        try:
-            q_vec = await _embedder.embed_one(query)
-        except Exception as exc:
-            logger.warning("[rag] embed failed for '%s': %s — BM25 only", name, exc)
-
-    try:
-        return store.hybrid_search(query, q_vec, top_k, bm25_weight)
-    except Exception as exc:
-        logger.warning("[rag] search failed for '%s': %s", name, exc)
-        return []
-
-
-def _keyword_match_databank(name: str, text: str) -> list[dict]:
-    """
-    Run SillyTavern keyword matching for a LoreBookDataBank.
-    Returns result dicts in the same {file, path, text, score} shape as
-    _search_databank so _format_results can consume them unchanged.
-    """
-    from TinyCTX.modules.rag.databanks import LoreBookDataBank
-    bank = _databanks.get(name)
-    if not isinstance(bank, LoreBookDataBank):
-        return []
-    try:
-        matched_contents = bank.keyword_match(text)
-    except Exception as exc:
-        logger.warning("[rag] keyword_match failed for '%s': %s", name, exc)
-        return []
-    return [
-        {"file": name, "path": name, "text": content, "score": 1.0}
-        for content in matched_contents
-        if content
-    ]
+    return await bank.rag_search(query, store, _embedder, top_k, bm25_weight)
 
 
 # ---------------------------------------------------------------------------
@@ -310,12 +276,11 @@ def register_agent(cycle) -> None:
                 continue
 
             bank = _databanks[name]
-            if bank.kind == "lorebook":
-                # ST-style keyword matching: no index needed, purely string-based
-                results = _keyword_match_databank(name, query)
-            else:
-                # Hybrid BM25+vector search for file-based banks
-                results = await _search_databank(name, query, top_k, bm25_weight)
+            try:
+                results = bank.auto_inject(query)
+            except Exception as exc:
+                logger.warning("[rag] auto_inject failed for '%s': %s", name, exc)
+                results = []
 
             if results:
                 auto_results_by_bank[name] = results
@@ -373,7 +338,7 @@ def register_agent(cycle) -> None:
 
         all_parts: list[str] = []
         for name in targets:
-            results = await _search_databank(name, query, k, bm25_weight)
+            results = await _do_rag_search(name, query, k, bm25_weight)
             block   = _format_results(results, budget_tokens, databank_name=name)
             if block:
                 all_parts.append(block)
