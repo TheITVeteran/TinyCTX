@@ -343,10 +343,16 @@ def register_agent(cycle) -> None:
         """
         Search one or more databanks for information relevant to a query.
 
+        Databank names come from the workspace/rag/ directory:
+          - A subfolder named "lore" -> target name "lore"
+          - A lorebook file named "Astraea.json" -> target name "Astraea"
+        Use rag_list_databanks() first if you are unsure of the available names.
+
         Args:
             query:       The topic, question, or keywords to search for.
-            targets:     List of databank names to search (e.g. ["lore", "characters"]).
-                         Use rag_list_databanks() to see available names.
+            targets:     List of databank name strings to search.
+                         Example: ["Astraea"] or ["lore", "characters"].
+                         Do NOT pass a generic word like "rag" — use the actual databank name.
             max_results: Maximum results to return per databank (0 = use module default).
         """
         if not isinstance(targets, list) or not targets:
@@ -385,9 +391,16 @@ def register_agent(cycle) -> None:
         Set which databanks are automatically searched and injected into context each turn.
         Call with an empty list to disable auto-injection entirely.
 
+        Databank names come from the workspace/rag/ directory:
+          - A subfolder named "lore" -> target name "lore"
+          - A lorebook file named "Astraea.json" -> target name "Astraea"
+        Use rag_list_databanks() first if you are unsure of the available names.
+
         Args:
-            targets: List of databank names to auto-inject (e.g. ["lore"]).
-                     Pass [] to clear.
+            targets: List of databank name strings to enable for auto-inject.
+                     Example: ["Astraea"] or ["lore", "characters"].
+                     Do NOT pass a generic word like "rag" — use the actual databank name.
+                     Pass [] to clear all auto-inject databanks.
         """
         if not isinstance(targets, list):
             return "[set_auto_rag_databanks error: targets must be a list]"

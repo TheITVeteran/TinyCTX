@@ -55,7 +55,20 @@ class LibrarianRunner:
         graph_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._db         = ladybug.Database(str(graph_path))
+        try:
+            self._db = ladybug.Database(str(graph_path))
+        except Exception as exc:
+            logger.warning(
+                "[knowledge] graph DB failed to open (%s) — wiping corrupted files and retrying",
+                exc,
+            )
+            for suffix in ("", ".wal", ".shm"):
+                p = Path(str(graph_path) + suffix)
+                if p.exists():
+                    p.unlink()
+                    logger.info("[knowledge] deleted %s", p)
+            self._db = ladybug.Database(str(graph_path))
+
         self._write_conn = ladybug.AsyncConnection(
             self._db,
             max_concurrent_queries=int(cfg.get("max_concurrent", 4)),
