@@ -16,8 +16,13 @@ via db.update_node_state_delta; the pre-assemble hook reads it each turn.
 Databank layout (workspace/rag/):
     lore/            <- FilesDataBank "lore"
     characters/      <- FilesDataBank "characters"
-    my_world.json    <- WorldInfoDataBank "my_world" (stub until implemented)
+    my_world.json    <- LoreBookDataBank "my_world"
     .cache/          <- SQLite DBs, one per databank (excluded from discovery)
+
+Auto-inject strategy by databank kind:
+    files    — hybrid BM25+vector search against the last user message
+    lorebook — SillyTavern keyword matching (keyword_match) against the last
+               user message; matched entries are injected verbatim
 
 Config is read from EXTENSION_META defaults merged with workspace overrides
 under the "rag" key in the workspace config.
@@ -132,6 +137,28 @@ async def _search_databank(
     except Exception as exc:
         logger.warning("[rag] search failed for '%s': %s", name, exc)
         return []
+
+
+def _keyword_match_databank(name: str, text: str) -> list[dict]:
+    """
+    Run SillyTavern keyword matching for a LoreBookDataBank.
+    Returns result dicts in the same {file, path, text, score} shape as
+    _search_databank so _format_results can consume them unchanged.
+    """
+    from TinyCTX.modules.rag.databanks import LoreBookDataBank
+    bank = _databanks.get(name)
+    if not isinstance(bank, LoreBookDataBank):
+        return []
+    try:
+        matched_contents = bank.keyword_match(text)
+    except Exception as exc:
+        logger.warning("[rag] keyword_match failed for '%s': %s", name, exc)
+        return []
+    return [
+        {"file": name, "path": name, "text": content, "score": 1.0}
+        for content in matched_contents
+        if content
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +286,7 @@ def register_agent(cycle) -> None:
         if not targets:
             return
 
-        # Extract last user query
+        # Extract last user message text
         query = ""
         for entry in reversed(ctx.dialogue):
             if entry.role == "user":
@@ -278,13 +305,21 @@ def register_agent(cycle) -> None:
             return
 
         for name in targets:
-            if name not in _stores:
-                logger.debug("[rag] auto-rag: unknown databank '%s'", name)
+            if name not in _databanks:
+                logger.debug("[rag] auto-inject: unknown databank '%s'", name)
                 continue
-            results = await _search_databank(name, query, top_k, bm25_weight)
+
+            bank = _databanks[name]
+            if bank.kind == "lorebook":
+                # ST-style keyword matching: no index needed, purely string-based
+                results = _keyword_match_databank(name, query)
+            else:
+                # Hybrid BM25+vector search for file-based banks
+                results = await _search_databank(name, query, top_k, bm25_weight)
+
             if results:
                 auto_results_by_bank[name] = results
-                logger.debug("[rag] auto-rag '%s': %d result(s)", name, len(results))
+                logger.debug("[rag] auto-inject '%s': %d result(s)", name, len(results))
 
     cycle.context.register_hook(HOOK_PRE_ASSEMBLE_ASYNC, _pre_assemble_async, priority=0)
 
@@ -347,7 +382,7 @@ def register_agent(cycle) -> None:
             return "[rag_search: no results found in the specified databank(s)]"
         return "\n\n".join(all_parts)
 
-    cycle.tool_handler.register_tool(rag_search, always_on=False, min_permission=25)
+    cycle.tool_handler.register_tool(rag_search, always_on=True, min_permission=25)
 
     # ------------------------------------------------------------------
     # Tool: set_auto_rag_databanks

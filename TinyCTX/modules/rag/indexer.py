@@ -15,8 +15,8 @@ Design notes
   BM25 search is available.
 - Files that cannot be read are skipped with a warning (already handled by
   DataBank.iter_files()).
-- WorldInfoDataBank raises NotImplementedError from iter_files(); the indexer
-  catches this and logs a skip so startup is not broken.
+- Any DataBank stub that raises NotImplementedError from iter_files() is caught
+  and logged; startup is not broken.
 
 Public API
 ----------
