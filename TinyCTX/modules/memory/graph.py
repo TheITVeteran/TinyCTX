@@ -101,13 +101,6 @@ ENTITY_TYPES = {
     "Organization", "Project", "Technology", "Rule", "Directive", "Role",
 }
 
-RELATION_VOCAB = {
-    "LIKES", "DISLIKES", "USES", "CREATED", "DEPENDS_ON", "CONFLICTS_WITH",
-    "PRECEDED_BY", "SUPERSEDES", "IS_A", "INSTANCE_OF", "MEMBER_OF",
-    "LOCATED_IN", "WORKED_ON", "KNOWS", "RELATED_TO", "ALIASED_TO",
-    "MERGED_INTO",
-}
-
 
 # ---------------------------------------------------------------------------
 # Schema init
