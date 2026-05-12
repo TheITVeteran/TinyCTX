@@ -12,4 +12,7 @@ Rules:
   Person, Concept, Preference, Fact, Event, Location, Organization,
   Project, Technology, Rule, Directive, Role
 - Use UPPER_SNAKE_CASE for relation names.
+- Prefer existing relation types when they fit. Existing types in this graph:
+  {relation_vocab}
+  Only introduce a new relation type if none of the above are a reasonable fit.
 - When done, stop calling tools and output a brief summary of what was extracted.

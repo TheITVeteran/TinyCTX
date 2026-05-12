@@ -23,6 +23,17 @@ def _prompt(filename: str) -> str:
     return (_PROMPTS_DIR / filename).read_text(encoding="utf-8")
 
 
+async def get_relation_types(conn) -> str:
+    """Return a comma-separated string of distinct active relation labels in the graph."""
+    r = await conn.execute(
+        "MATCH ()-[r:Relation]->() WHERE r.superseded_at IS NULL RETURN DISTINCT r.relation ORDER BY r.relation"
+    )
+    labels = []
+    while r.has_next():
+        labels.append(r.get_next()[0])
+    return ", ".join(labels) if labels else "(none yet)"
+
+
 def _set(conn, uid: str, field: str, value):
     """Issue a single-field SET via two-param query (uuid + value).
     Ladybug's param binder works reliably for exactly 2 params."""
@@ -83,9 +94,11 @@ async def run_buffer_agent(
     write_tools = _make_write_tools(conn, write_lock)
     read_tools  = _make_read_tools(conn)
 
+    relation_vocab = await get_relation_types(conn)
+
     await _agent_loop(
         llm,
-        _prompt("buffer_system.txt"),
+        _prompt("buffer_system.txt").format(relation_vocab=relation_vocab),
         _prompt("buffer_user.txt").format(batch_text=batch_text),
         write_tools + read_tools,
         agent_logger,
@@ -108,9 +121,11 @@ async def run_targeted_agent(
     write_tools = _make_write_tools(conn, write_lock)
     read_tools  = _make_read_tools(conn)
 
+    relation_vocab = await get_relation_types(conn)
+
     await _agent_loop(
         llm,
-        _prompt("targeted_system.txt"),
+        _prompt("targeted_system.txt").format(relation_vocab=relation_vocab),
         prompt,
         write_tools + read_tools,
         agent_logger,
