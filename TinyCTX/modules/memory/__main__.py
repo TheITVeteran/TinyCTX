@@ -1,4 +1,4 @@
-"""
+﻿"""
 modules/knowledge/__main__.py
 
 Registers the knowledge module into the agent.
@@ -50,7 +50,7 @@ class LibrarianRunner:
         embedder,
     ) -> None:
         import ladybug
-        from TinyCTX.modules.knowledge.graph import init_schema
+        from TinyCTX.modules.memory.graph import init_schema
 
         graph_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,14 +59,14 @@ class LibrarianRunner:
             self._db = ladybug.Database(str(graph_path))
         except Exception as exc:
             logger.warning(
-                "[knowledge] graph DB failed to open (%s) — wiping corrupted files and retrying",
+                "[memory] graph DB failed to open (%s) — wiping corrupted files and retrying",
                 exc,
             )
             for suffix in ("", ".wal", ".shm"):
                 p = Path(str(graph_path) + suffix)
                 if p.exists():
                     p.unlink()
-                    logger.info("[knowledge] deleted %s", p)
+                    logger.info("[memory] deleted %s", p)
             self._db = ladybug.Database(str(graph_path))
 
         self._write_conn = ladybug.AsyncConnection(
@@ -86,7 +86,7 @@ class LibrarianRunner:
         self._embedder = embedder
 
         # Dedicated file logger for all librarian agent text output
-        self.agent_logger = logging.getLogger("knowledge.librarian.agent")
+        self.agent_logger = logging.getLogger("memory.librarian.agent")
         if not self.agent_logger.handlers:
             fh = logging.FileHandler(log_path, encoding="utf-8")
             fh.setFormatter(logging.Formatter(
@@ -116,7 +116,7 @@ class LibrarianRunner:
     def start(self) -> None:
         """Schedule the poll loop as a background asyncio task."""
         self._task = asyncio.create_task(self._run(), name="knowledge-librarian")
-        logger.info("[knowledge] LibrarianRunner started")
+        logger.info("[memory] LibrarianRunner started")
 
     def stop(self) -> None:
         if self._task and not self._task.done():
@@ -128,20 +128,20 @@ class LibrarianRunner:
                 try:
                     await self._poll_cycle()
                 except Exception:
-                    logger.exception("[knowledge/librarian] poll cycle error")
+                    logger.exception("[memory/librarian] poll cycle error")
                 await asyncio.sleep(60)
         except asyncio.CancelledError:
             # Drain in-flight agent tasks
             if self._active_tasks:
                 logger.info(
-                    "[knowledge/librarian] draining %d in-flight task(s)",
+                    "[memory/librarian] draining %d in-flight task(s)",
                     len(self._active_tasks),
                 )
                 await asyncio.gather(*self._active_tasks, return_exceptions=True)
-            logger.info("[knowledge/librarian] stopped")
+            logger.info("[memory/librarian] stopped")
 
     async def _poll_cycle(self) -> None:
-        from TinyCTX.modules.knowledge.librarian_agents import (
+        from TinyCTX.modules.memory.librarian_agents import (
             run_buffer_agent, run_targeted_agent, run_dedup_cycle,
             nodes_to_text,
         )
@@ -150,7 +150,7 @@ class LibrarianRunner:
         done = {t for t in self._active_tasks if t.done()}
         for t in done:
             if not t.cancelled() and t.exception():
-                logger.error("[knowledge/librarian] agent task raised: %s", t.exception())
+                logger.error("[memory/librarian] agent task raised: %s", t.exception())
         self._active_tasks -= done
 
         max_concurrent = int(self._cfg.get("max_concurrent", 4))
@@ -171,7 +171,7 @@ class LibrarianRunner:
                     )
                     self._active_tasks.add(t)
                 elif prompt:
-                    logger.warning("[knowledge/librarian] concurrency cap reached, dropping targeted msg")
+                    logger.warning("[memory/librarian] concurrency cap reached, dropping targeted msg")
             # "trigger" falls through to the node walk below
 
         # Node walk on schedule
@@ -202,7 +202,7 @@ class LibrarianRunner:
                     )
                 )
                 self._active_tasks.add(t)
-                logger.info("[knowledge/librarian] dispatched agent for %d node(s)", len(flagged_ids))
+                logger.info("[memory/librarian] dispatched agent for %d node(s)", len(flagged_ids))
 
         # Dedup on schedule
         dedup_enabled  = bool(self._cfg.get("dedup_enabled", True))
@@ -252,14 +252,14 @@ def register_agent(agent) -> None:
     # Config resolution
     # ------------------------------------------------------------------
     try:
-        from TinyCTX.modules.knowledge import EXTENSION_META
+        from TinyCTX.modules.memory import EXTENSION_META
         defaults: dict = EXTENSION_META.get("default_config", {})
     except ImportError:
         defaults = {}
 
     overrides: dict = {}
     if hasattr(agent.config, "extra") and isinstance(agent.config.extra, dict):
-        overrides = agent.config.extra.get("knowledge", {})
+        overrides = agent.config.extra.get("memory", {})
 
     cfg: dict = {**defaults, **overrides}
 
@@ -268,7 +268,7 @@ def register_agent(agent) -> None:
         return p if p.is_absolute() else workspace / p
 
     graph_path  = _resolve(cfg["graph_path"])
-    log_path    = _resolve(cfg.get("librarian_log", "knowledge/librarian.log"))
+    log_path    = _resolve(cfg.get("librarian_log", "memory/librarian.log"))
     pinned_prio = int(cfg.get("pinned_priority", 5))
     agent_db    = workspace / "agent.db"
 
@@ -282,10 +282,10 @@ def register_agent(agent) -> None:
             from TinyCTX.ai import Embedder
             emb_cfg  = agent.config.get_embedding_model(embedding_model)
             embedder = Embedder.from_config(emb_cfg)
-            logger.info("[knowledge] embedder: %s @ %s", emb_cfg.model, emb_cfg.base_url)
+            logger.info("[memory] embedder: %s @ %s", emb_cfg.model, emb_cfg.base_url)
         except (KeyError, ValueError) as exc:
             logger.warning(
-                "[knowledge] embedding_model '%s' not usable (%s) — semantic search disabled",
+                "[memory] embedding_model '%s' not usable (%s) — semantic search disabled",
                 embedding_model, exc,
             )
 
@@ -326,7 +326,7 @@ def register_agent(agent) -> None:
     # ------------------------------------------------------------------
     # 2. GraphDB for read tools — connection from the shared Database
     # ------------------------------------------------------------------
-    from TinyCTX.modules.knowledge.graph import GraphDB
+    from TinyCTX.modules.memory.graph import GraphDB
     read_conn = runner.new_read_connection()
     graph_db  = GraphDB(read_conn)
     atexit.register(read_conn.close)
@@ -347,13 +347,13 @@ def register_agent(agent) -> None:
             semantic: If true (default), use vector similarity search.
                 If false or no embedding model configured, uses keyword search.
         """
-        from TinyCTX.modules.knowledge.graph import top_k_cosine
+        from TinyCTX.modules.memory.graph import top_k_cosine
 
         if semantic and embedder is not None:
             try:
                 query_vec = await embedder.embed_one(query)
             except Exception as exc:
-                logger.warning("[knowledge] kg_search embed failed: %s — falling back to keyword", exc)
+                logger.warning("[memory] kg_search embed failed: %s — falling back to keyword", exc)
                 query_vec = None
         else:
             query_vec = None
@@ -525,13 +525,13 @@ def register_agent(agent) -> None:
         return "\n".join(lines)
 
     agent.context.register_prompt(
-        "knowledge_pinned",
+        "memory_pinned",
         _pinned_provider,
         role="system",
         priority=pinned_prio,
     )
 
     logger.info(
-        "[knowledge] ready — graph: %s | embedder: %s",
+        "[memory] ready — graph: %s | embedder: %s",
         graph_path, embedding_model or "none",
     )

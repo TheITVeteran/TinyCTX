@@ -1,5 +1,5 @@
-"""
-modules/knowledge/graph.py
+﻿"""
+modules/memory/graph.py
 
 LadybugDB schema initialisation and low-level graph access helpers.
 (LadybugDB is the community-maintained fork of KùzuDB.)
@@ -121,7 +121,7 @@ def init_schema(conn) -> None:
     """
     for ddl in _SCHEMA_DDL:
         conn.execute(ddl.strip())
-    logger.info("[knowledge/graph] schema initialised")
+    logger.info("[memory/graph] schema initialised")
 
 
 # ---------------------------------------------------------------------------

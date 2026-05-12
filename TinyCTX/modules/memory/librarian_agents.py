@@ -1,5 +1,5 @@
-"""
-modules/knowledge/librarian_agents.py
+﻿"""
+modules/memory/librarian_agents.py
 
 Pure agent logic for the knowledge librarian: buffer ingestion, targeted
 edits, and dedup. No process management, no IPC, no event loop ownership.
@@ -144,9 +144,9 @@ async def run_dedup_cycle(
     embedder,
     agent_logger: logging.Logger,
 ) -> None:
-    logger.info("[knowledge/librarian] dedup cycle starting")
+    logger.info("[memory/librarian] dedup cycle starting")
     try:
-        from TinyCTX.modules.knowledge.graph import (
+        from TinyCTX.modules.memory.graph import (
             embed_content_for, embed_hash, cosine_similarity, now_ts,
         )
 
@@ -162,7 +162,7 @@ async def run_dedup_cycle(
             entities.append(dict(zip(col_names, r.get_next())))
 
         if len(entities) < 2:
-            logger.info("[knowledge/librarian] dedup: fewer than 2 entities, skipping")
+            logger.info("[memory/librarian] dedup: fewer than 2 entities, skipping")
             return
 
         embed_model_name = getattr(embedder, "model", "")
@@ -177,7 +177,7 @@ async def run_dedup_cycle(
                 stale.append(e)
 
         if stale:
-            logger.info("[knowledge/librarian] dedup: refreshing %d stale embedding(s)", len(stale))
+            logger.info("[memory/librarian] dedup: refreshing %d stale embedding(s)", len(stale))
             texts   = [embed_content_for(e["e.name"], e["e.description"]) for e in stale]
             vectors = await embedder.embed(texts)
             async with write_lock:
@@ -212,10 +212,10 @@ async def run_dedup_cycle(
                     candidates.append((ea, eb, score))
 
         if not candidates:
-            logger.info("[knowledge/librarian] dedup: no candidate pairs above threshold %.2f", threshold)
+            logger.info("[memory/librarian] dedup: no candidate pairs above threshold %.2f", threshold)
             return
 
-        logger.info("[knowledge/librarian] dedup: %d candidate pair(s) to evaluate", len(candidates))
+        logger.info("[memory/librarian] dedup: %d candidate pair(s) to evaluate", len(candidates))
 
         already_aliased: set[frozenset] = set()
         r = await conn.execute(
@@ -233,13 +233,13 @@ async def run_dedup_cycle(
                 continue
             await _dedup_pair(conn, write_lock, llm, ea, eb, agent_logger)
 
-        logger.info("[knowledge/librarian] dedup cycle complete")
+        logger.info("[memory/librarian] dedup cycle complete")
     except Exception:
-        logger.exception("[knowledge/librarian] dedup cycle error")
+        logger.exception("[memory/librarian] dedup cycle error")
 
 
 async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, agent_logger: logging.Logger) -> None:
-    from TinyCTX.modules.knowledge.graph import now_ts
+    from TinyCTX.modules.memory.graph import now_ts
     from TinyCTX.ai import TextDelta
 
     prompt = _prompt("dedup_user.txt").format(
@@ -264,7 +264,7 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
         verdict_data = json.loads(raw)
     except json.JSONDecodeError:
         logger.warning(
-            "[knowledge/librarian] dedup: could not parse verdict for %s/%s: %s",
+            "[memory/librarian] dedup: could not parse verdict for %s/%s: %s",
             ea["e.uuid"][:8], eb["e.uuid"][:8], raw[:200],
         )
         return
@@ -277,7 +277,7 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
         return
 
     if not canonical_uuid or canonical_uuid not in {ea["e.uuid"], eb["e.uuid"]}:
-        logger.warning("[knowledge/librarian] dedup: invalid canonical_uuid in verdict")
+        logger.warning("[memory/librarian] dedup: invalid canonical_uuid in verdict")
         return
 
     dup_uuid = eb["e.uuid"] if canonical_uuid == ea["e.uuid"] else ea["e.uuid"]
@@ -285,7 +285,7 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
 
     async with write_lock:
         if verdict == "duplicate":
-            logger.info("[knowledge/librarian] dedup: merging %s → %s", dup_uuid[:8], canonical_uuid[:8])
+            logger.info("[memory/librarian] dedup: merging %s → %s", dup_uuid[:8], canonical_uuid[:8])
             await _aset(conn, canonical_uuid, "description", merged_desc)
             await _aset(conn, canonical_uuid, "updated_at",  now)
             await _aset(conn, canonical_uuid, "embed_hash",  "")
@@ -312,7 +312,7 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
                 parameters={"uid": dup_uuid},
             )
         elif verdict == "alias":
-            logger.info("[knowledge/librarian] dedup: aliasing %s → %s", dup_uuid[:8], canonical_uuid[:8])
+            logger.info("[memory/librarian] dedup: aliasing %s → %s", dup_uuid[:8], canonical_uuid[:8])
             await _aset(conn, dup_uuid, "description", merged_desc)
             await _aset(conn, dup_uuid, "updated_at",  now)
             await conn.execute(
@@ -329,7 +329,7 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
 # ---------------------------------------------------------------------------
 
 def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
-    from TinyCTX.modules.knowledge.graph import new_uuid, now_ts
+    from TinyCTX.modules.memory.graph import new_uuid, now_ts
     tools = []
 
     async def add_entity(
@@ -680,7 +680,7 @@ async def _agent_loop(
             elif isinstance(event, ToolCallAssembled):
                 tool_calls.append({"id": event.call_id, "name": event.tool_name, "args": event.args})
             elif isinstance(event, LLMError):
-                logger.error("[knowledge/librarian] LLM error: %s", event.message)
+                logger.error("[memory/librarian] LLM error: %s", event.message)
                 return
 
         response_text = "".join(text_chunks)
@@ -714,7 +714,7 @@ async def _agent_loop(
                     result = await fn(**tc["args"])
                 except Exception as exc:
                     result = f"[error: {exc}]"
-                    logger.warning("[knowledge/librarian] tool %s error: %s", tc["name"], exc)
+                    logger.warning("[memory/librarian] tool %s error: %s", tc["name"], exc)
 
             agent_logger.debug("  tool %s → %s", tc["name"], result)
             messages.append({
@@ -723,4 +723,4 @@ async def _agent_loop(
                 "content":      str(result),
             })
 
-    logger.warning("[knowledge/librarian] hit max_cycles (%d)", max_cycles)
+    logger.warning("[memory/librarian] hit max_cycles (%d)", max_cycles)
