@@ -1,4 +1,4 @@
-﻿"""
+"""
 modules/knowledge/__main__.py
 
 Registers the knowledge module into the agent.
@@ -131,7 +131,6 @@ class LibrarianRunner:
                     logger.exception("[memory/librarian] poll cycle error")
                 await asyncio.sleep(60)
         except asyncio.CancelledError:
-            # Drain in-flight agent tasks
             if self._active_tasks:
                 logger.info(
                     "[memory/librarian] draining %d in-flight task(s)",
@@ -172,7 +171,6 @@ class LibrarianRunner:
                     self._active_tasks.add(t)
                 elif prompt:
                     logger.warning("[memory/librarian] concurrency cap reached, dropping targeted msg")
-            # "trigger" falls through to the node walk below
 
         # Node walk on schedule
         now = time.time()
@@ -327,159 +325,24 @@ def register_agent(agent) -> None:
     # 2. GraphDB for read tools — connection from the shared Database
     # ------------------------------------------------------------------
     from TinyCTX.modules.memory.graph import GraphDB
+    import TinyCTX.modules.memory.tools as tools
+
     read_conn = runner.new_read_connection()
     graph_db  = GraphDB(read_conn)
     atexit.register(read_conn.close)
 
+    tools.init(runner._write_conn, runner._write_lock, graph_db, embedder)
+
     # ------------------------------------------------------------------
-    # 3. Read tools
+    # 3. Register tools on the main agent
     # ------------------------------------------------------------------
-
-    async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
-        """
-        Search the knowledge graph for entities relevant to a query.
-        Returns matching entities with their direct active relationships.
-        Bumps mention_count on returned nodes.
-
-        Args:
-            query: Natural language query or keywords to search for.
-            top_k: Maximum number of entities to return (default 5).
-            semantic: If true (default), use vector similarity search.
-                If false or no embedding model configured, uses keyword search.
-        """
-        from TinyCTX.modules.memory.graph import top_k_cosine
-
-        if semantic and embedder is not None:
-            try:
-                query_vec = await embedder.embed_one(query)
-            except Exception as exc:
-                logger.warning("[memory] kg_search embed failed: %s — falling back to keyword", exc)
-                query_vec = None
-        else:
-            query_vec = None
-
-        if query_vec is not None:
-            all_embs = graph_db.all_entities_with_embeddings()
-            top      = top_k_cosine(query_vec, all_embs, top_k)
-            uids     = [uid for uid, _ in top]
-        else:
-            results = graph_db.find_entity(name=query)
-            uids = [r["uuid"] for r in results[:top_k]]
-
-        if not uids:
-            return "[no matching entities found]"
-
-        graph_db.bump_mention_count(uids)
-
-        lines = []
-        for uid in uids:
-            entity = graph_db.get_entity(uid)
-            if not entity:
-                continue
-            name  = entity.get("e.name", "?")
-            etype = entity.get("e.entity_type", "?")
-            desc  = entity.get("e.description", "")
-            lines.append(f"[{etype}] {name} (uuid: {uid[:8]})\n  {desc}")
-            for edge in entity.get("edges_out", []):
-                lines.append(f"  →[{edge['relation']}]→ {edge['target_name']}")
-            for edge in entity.get("edges_in", []):
-                lines.append(f"  ←[{edge['relation']}]← {edge['source_name']}")
-
-        return "\n\n".join(lines) if lines else "[no entities found]"
-
-    async def kg_traverse(
-        uuid: str,
-        hops: int = 1,
-        relation_filter: str = "",
-    ) -> str:
-        """
-        Walk the graph from an entity outward up to N hops.
-        Returns all active edges encountered.
-
-        Args:
-            uuid: Starting entity UUID.
-            hops: Number of hops to traverse (default 1, max 3).
-            relation_filter: If provided, only follow edges with this relation label.
-        """
-        hops = min(int(hops), 3)
-        edges = graph_db.traverse(uuid, hops, relation_filter or None)
-        if not edges:
-            return f"[no edges found from {uuid[:8]}]"
-        lines = [f"Traversal from {uuid[:8]} ({hops} hop(s)):"]
-        for e in edges:
-            lines.append(f"  {e['source_uuid'][:8] if 'source_uuid' in e else uuid[:8]} "
-                         f"→[{e['relation']}]→ {e['target_name']} ({e['target_uuid'][:8]})")
-        return "\n".join(lines)
-
-    async def kg_get_entity(uuid: str) -> str:
-        """
-        Retrieve full details of a knowledge graph entity including all
-        active incoming and outgoing relationships.
-
-        Args:
-            uuid: The entity UUID to retrieve.
-        """
-        entity = graph_db.get_entity(uuid)
-        if not entity:
-            return f"[entity {uuid[:8]} not found]"
-
-        name  = entity.get("e.name", "?")
-        etype = entity.get("e.entity_type", "?")
-        desc  = entity.get("e.description", "")
-        pin   = entity.get("e.pinned", False)
-        pri   = entity.get("e.priority", 40)
-        mc    = entity.get("e.mention_count", 0)
-
-        lines = [
-            f"[{etype}] {name}",
-            f"uuid: {uuid}",
-            f"description: {desc}",
-            f"pinned: {pin}  priority: {pri}  mentions: {mc}",
-        ]
-        for e in entity.get("edges_out", []):
-            lines.append(f"  →[{e['relation']}]→ {e['target_name']} ({e['target_uuid'][:8]})"
-                         + (f" — {e['description']}" if e.get("description") else ""))
-        for e in entity.get("edges_in", []):
-            lines.append(f"  ←[{e['relation']}]← {e['source_name']} ({e['source_uuid'][:8]})"
-                         + (f" — {e['description']}" if e.get("description") else ""))
-
-        return "\n".join(lines)
-
-    async def kg_list(entity_type: str = "", pinned_only: bool = False) -> str:
-        """
-        List knowledge graph entities, optionally filtered by type or pinned status.
-
-        Args:
-            entity_type: Filter by type (e.g. Person, Project, Technology). Empty = all types.
-            pinned_only: If true, return only pinned entities.
-        """
-        entities = graph_db.list_entities(
-            entity_type=entity_type or None,
-            pinned_only=pinned_only,
-        )
-        if not entities:
-            return "[no entities found]"
-        lines = []
-        for e in entities:
-            pin = "📌 " if e.get("pinned") else ""
-            lines.append(f"{pin}[{e['entity_type']}] {e['name']} ({e['uuid'][:8]}) pri={e['priority']}\n  {e['description']}")
-        return "\n\n".join(lines)
-
-    async def kg_stats() -> str:
-        """
-        Show knowledge graph statistics: entity count, edge count, breakdown by type.
-        """
-        stats = graph_db.get_stats()
-        lines = [
-            f"Entities: {stats['entity_count']}",
-            f"Active edges: {stats['active_edge_count']}",
-            "By type:",
-        ]
-        for etype, count in stats["by_type"].items():
-            lines.append(f"  {etype}: {count}")
-        return "\n".join(lines)
-
-    for fn in [kg_search, kg_traverse, kg_get_entity, kg_list, kg_stats]:
+    for fn in [
+        tools.kg_search,
+        tools.kg_traverse,
+        tools.kg_get_entity,
+        tools.kg_list,
+        tools.kg_stats,
+    ]:
         always = (fn.__name__ == "kg_search")
         agent.tool_handler.register_tool(fn, always_on=always, min_permission=25)
 

@@ -1,4 +1,4 @@
-﻿"""
+"""
 modules/memory/librarian_agents.py
 
 Pure agent logic for the knowledge librarian: buffer ingestion, targeted
@@ -40,17 +40,9 @@ async def get_relation_types(conn) -> str:
     extras = [l for l in live if l not in defaults]
     return ", ".join(defaults + extras)
 
-def _set(conn, uid: str, field: str, value):
-    """Issue a single-field SET via two-param query (uuid + value).
-    Ladybug's param binder works reliably for exactly 2 params."""
-    return conn.execute(
-        f"MATCH (e:Entity) WHERE e.uuid = $uid SET e.{field} = $v",
-        parameters={"uid": uid, "v": value},
-    )
-
 
 async def _aset(conn, uid: str, field: str, value):
-    """Async version of _set."""
+    """Async single-field SET."""
     return await conn.execute(
         f"MATCH (e:Entity) WHERE e.uuid = $uid SET e.{field} = $v",
         parameters={"uid": uid, "v": value},
@@ -85,6 +77,29 @@ def nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shared: build a ToolCallHandler for librarian agents
+# ---------------------------------------------------------------------------
+
+def _make_tool_handler():
+    from TinyCTX.utils.tool_handler import ToolCallHandler
+    import TinyCTX.modules.memory.tools as tools
+
+    handler = ToolCallHandler()
+    for fn in [
+        tools.kg_add_entity,
+        tools.kg_update_entity,
+        tools.kg_add_relationship,
+        tools.kg_supersede_relationship,
+        tools.kg_delete_entity,
+        tools.kg_delete_relationship,
+        tools.kg_find_entity,
+        tools.kg_get_entity,
+    ]:
+        handler.register_tool(fn, always_on=True, min_permission=25)
+    return handler
+
+
+# ---------------------------------------------------------------------------
 # Buffer agent
 # ---------------------------------------------------------------------------
 
@@ -97,16 +112,12 @@ async def run_buffer_agent(
     agent_logger: logging.Logger,
 ) -> None:
     """Ingest a batch of conversation nodes into the knowledge graph."""
-    write_tools = _make_write_tools(conn, write_lock)
-    read_tools  = _make_read_tools(conn)
-
     relation_vocab = await get_relation_types(conn)
-
     await _agent_loop(
         llm,
         _prompt("buffer_system.txt").format(relation_vocab=relation_vocab),
         _prompt("buffer_user.txt").format(batch_text=batch_text),
-        write_tools + read_tools,
+        _make_tool_handler(),
         agent_logger,
     )
 
@@ -124,16 +135,12 @@ async def run_targeted_agent(
     agent_logger: logging.Logger,
 ) -> None:
     """Execute a specific graph-edit instruction."""
-    write_tools = _make_write_tools(conn, write_lock)
-    read_tools  = _make_read_tools(conn)
-
     relation_vocab = await get_relation_types(conn)
-
     await _agent_loop(
         llm,
         _prompt("targeted_system.txt").format(relation_vocab=relation_vocab),
         prompt,
-        write_tools + read_tools,
+        _make_tool_handler(),
         agent_logger,
     )
 
@@ -295,7 +302,6 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
             await _aset(conn, canonical_uuid, "description", merged_desc)
             await _aset(conn, canonical_uuid, "updated_at",  now)
             await _aset(conn, canonical_uuid, "embed_hash",  "")
-            # Copy outgoing edges from dup to canonical
             await conn.execute(
                 "MATCH (dup:Entity)-[r:Relation]->(x:Entity), (c:Entity) "
                 "WHERE dup.uuid = $dup AND r.superseded_at IS NULL "
@@ -304,7 +310,6 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
                 "description: r.description, created_at: r.created_at, superseded_at: null}]->(x)",
                 parameters={"dup": dup_uuid, "canon": canonical_uuid},
             )
-            # Copy incoming edges from dup to canonical
             await conn.execute(
                 "MATCH (x:Entity)-[r:Relation]->(dup:Entity), (c:Entity) "
                 "WHERE dup.uuid = $dup AND r.superseded_at IS NULL "
@@ -331,347 +336,21 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
 
 
 # ---------------------------------------------------------------------------
-# Graph write tools
-# ---------------------------------------------------------------------------
-
-def _make_write_tools(conn, write_lock: asyncio.Lock) -> list[dict]:
-    from TinyCTX.modules.memory.graph import new_uuid, now_ts
-    tools = []
-
-    async def add_entity(
-        name: str,
-        entity_type: str,
-        description: str,
-        priority: int = 40,
-        pinned: bool = False,
-    ) -> str:
-        """
-        Add or update a knowledge graph entity. Returns the entity UUID.
-        Uses MERGE on name+type so duplicate calls are idempotent.
-
-        Args:
-            name: Display name of the entity.
-            entity_type: One of: Person, Concept, Preference, Fact, Event,
-                Location, Organization, Project, Technology, Rule, Directive, Role.
-            description: 1-3 sentence factual description.
-            priority: 0-100 importance score (default 40).
-            pinned: If true, inject into every system prompt.
-        """
-        now = now_ts()
-        r = await conn.execute(
-            "MATCH (e:Entity) WHERE e.name = $name AND e.entity_type = $et RETURN e.uuid LIMIT 1",
-            parameters={"name": name, "et": entity_type},
-        )
-        if r.has_next():
-            uid = r.get_next()[0]
-            async with write_lock:
-                await _aset(conn, uid, "description",  description)
-                await _aset(conn, uid, "updated_at",   now)
-                await _aset(conn, uid, "priority",     priority)
-                await _aset(conn, uid, "pinned",       pinned)
-                await _aset(conn, uid, "embed_hash",   "")
-            return uid
-        uid = new_uuid()
-        async with write_lock:
-            await conn.execute(
-                "CREATE (e:Entity {uuid: $uid})",
-                parameters={"uid": uid},
-            )
-            await _aset(conn, uid, "name",          name)
-            await _aset(conn, uid, "entity_type",   entity_type)
-            await _aset(conn, uid, "description",   description)
-            await _aset(conn, uid, "pinned",        pinned)
-            await _aset(conn, uid, "priority",      priority)
-            await _aset(conn, uid, "mention_count", 0)
-            await _aset(conn, uid, "created_at",    now)
-            await _aset(conn, uid, "updated_at",    now)
-            await _aset(conn, uid, "embed_model",   "")
-            await _aset(conn, uid, "embed_content", "")
-            await _aset(conn, uid, "embed_hash",    "")
-        return uid
-
-    async def update_entity(
-        uuid: str,
-        description: str | None = None,
-        priority: int | None = None,
-        pinned: bool | None = None,
-    ) -> str:
-        """
-        Update fields on an existing entity. Only provided fields are changed.
-
-        Args:
-            uuid: The entity UUID.
-            description: New description (optional).
-            priority: New priority value (optional).
-            pinned: New pinned flag (optional).
-        """
-        now  = now_ts()
-        if description is None and priority is None and pinned is None:
-            return f"[no fields to update for {uuid}]"
-        async with write_lock:
-            if description is not None:
-                await _aset(conn, uuid, "description", description)
-                await _aset(conn, uuid, "embed_hash",  "")
-            if priority is not None:
-                await _aset(conn, uuid, "priority", priority)
-            if pinned is not None:
-                await _aset(conn, uuid, "pinned", pinned)
-            await _aset(conn, uuid, "updated_at", now)
-        return f"updated {uuid}"
-
-    async def add_relationship(
-        source_uuid: str,
-        target_uuid: str,
-        relation: str,
-        weight: float = 0.5,
-        description: str = "",
-    ) -> str:
-        """
-        Add a directed relationship between two entities.
-
-        Args:
-            source_uuid: UUID of the source entity.
-            target_uuid: UUID of the target entity.
-            relation: UPPER_SNAKE_CASE relation label.
-            weight: Strength 0.0-1.0 (default 0.5).
-            description: Optional explanation.
-        """
-        now = now_ts()
-        rel  = relation.upper().replace("'", "")
-        desc = description.replace("'", "''")
-        async with write_lock:
-            await conn.execute(
-                f"MATCH (a:Entity), (b:Entity) WHERE a.uuid = $src AND b.uuid = $tgt "
-                f"CREATE (a)-[:Relation {{relation: '{rel}', weight: {weight!r}, "
-                f"description: '{desc}', created_at: {now!r}, superseded_at: null}}]->(b)",
-                parameters={"src": source_uuid, "tgt": target_uuid},
-            )
-        return f"added {relation} from {source_uuid[:8]} → {target_uuid[:8]}"
-
-    async def supersede_relationship(
-        src_uuid: str,
-        tgt_uuid: str,
-        old_relation: str,
-        new_relation: str,
-        weight: float = 0.5,
-        description: str = "",
-    ) -> str:
-        """
-        Mark an existing relationship as superseded and create a replacement.
-
-        Args:
-            src_uuid: Source entity UUID.
-            tgt_uuid: Target entity UUID.
-            old_relation: The relation label to supersede.
-            new_relation: The new relation label to create.
-            weight: Weight for the new relationship.
-            description: Optional explanation.
-        """
-        now  = now_ts()
-        old  = old_relation.upper().replace("'", "")
-        new  = new_relation.upper().replace("'", "")
-        desc = description.replace("'", "''")
-        async with write_lock:
-            await conn.execute(
-                f"MATCH (a:Entity)-[r:Relation]->(b:Entity) "
-                f"WHERE a.uuid = $src AND b.uuid = $tgt "
-                f"AND r.relation = '{old}' AND r.superseded_at IS NULL "
-                f"SET r.superseded_at = {now!r}",
-                parameters={"src": src_uuid, "tgt": tgt_uuid},
-            )
-            await conn.execute(
-                f"MATCH (a:Entity), (b:Entity) WHERE a.uuid = $src AND b.uuid = $tgt "
-                f"CREATE (a)-[:Relation {{relation: '{new}', weight: {weight!r}, "
-                f"description: '{desc}', created_at: {now!r}, superseded_at: null}}]->(b)",
-                parameters={"src": src_uuid, "tgt": tgt_uuid},
-            )
-        return f"superseded {old_relation} → {new_relation} from {src_uuid[:8]} → {tgt_uuid[:8]}"
-
-    async def delete_entity(uuid: str) -> str:
-        """
-        Hard-delete an entity and all its edges. Use sparingly.
-
-        Args:
-            uuid: The entity UUID to delete.
-        """
-        async with write_lock:
-            await conn.execute(
-                "MATCH (e:Entity) WHERE e.uuid = $uid DETACH DELETE e",
-                parameters={"uid": uuid},
-            )
-        return f"deleted entity {uuid[:8]}"
-
-    async def delete_relationship(src_uuid: str, tgt_uuid: str, relation: str) -> str:
-        """
-        Delete all active edges of a given relation type between two entities.
-
-        Args:
-            src_uuid: Source entity UUID.
-            tgt_uuid: Target entity UUID.
-            relation: The relation label to delete.
-        """
-        rel = relation.upper().replace("'", "")
-        async with write_lock:
-            await conn.execute(
-                f"MATCH (a:Entity)-[r:Relation]->(b:Entity) "
-                f"WHERE a.uuid = $src AND b.uuid = $tgt "
-                f"AND r.relation = '{rel}' AND r.superseded_at IS NULL DELETE r",
-                parameters={"src": src_uuid, "tgt": tgt_uuid},
-            )
-        return f"deleted {relation} from {src_uuid[:8]} → {tgt_uuid[:8]}"
-
-    for fn in [
-        add_entity, update_entity, add_relationship,
-        supersede_relationship, delete_entity, delete_relationship,
-    ]:
-        tools.append({"fn": fn, "name": fn.__name__, "doc": fn.__doc__})
-
-    return tools
-
-
-# ---------------------------------------------------------------------------
-# Graph read tools
-# ---------------------------------------------------------------------------
-
-def _make_read_tools(conn) -> list[dict]:
-    tools = []
-
-    async def find_entity(name: str = "", entity_type: str = "") -> str:
-        """
-        Search for entities by name substring and/or type. Use before add_entity
-        to avoid creating duplicates.
-
-        Args:
-            name: Partial name to search for (case-sensitive substring match).
-            entity_type: Filter by entity type (exact match, optional).
-        """
-        if name and entity_type:
-            r = await conn.execute(
-                "MATCH (e:Entity) WHERE e.name CONTAINS $name AND e.entity_type = $et "
-                "RETURN e.uuid, e.name, e.entity_type, e.description LIMIT 10",
-                parameters={"name": name, "et": entity_type},
-            )
-        elif name:
-            r = await conn.execute(
-                "MATCH (e:Entity) WHERE e.name CONTAINS $name "
-                "RETURN e.uuid, e.name, e.entity_type, e.description LIMIT 10",
-                parameters={"name": name},
-            )
-        elif entity_type:
-            r = await conn.execute(
-                "MATCH (e:Entity) WHERE e.entity_type = $et "
-                "RETURN e.uuid, e.name, e.entity_type, e.description LIMIT 10",
-                parameters={"et": entity_type},
-            )
-        else:
-            return "[provide name or entity_type]"
-        rows = []
-        while r.has_next():
-            row = r.get_next()
-            rows.append(f"uuid={row[0]} name={row[1]} type={row[2]}\n  {row[3]}")
-        return "\n\n".join(rows) if rows else "[no entities found]"
-
-    async def get_entity(uuid: str) -> str:
-        """
-        Get full details of an entity including all active relationships.
-
-        Args:
-            uuid: The entity UUID to retrieve.
-        """
-        r = await conn.execute(
-            "MATCH (e:Entity {uuid: $uid}) RETURN e.*",
-            parameters={"uid": uuid},
-        )
-        if not r.has_next():
-            return f"[entity {uuid[:8]} not found]"
-        row  = r.get_next()
-        cols = r.get_column_names()
-        data = dict(zip(cols, row))
-        data.pop("e.embedding", None)
-
-        edges_out = await conn.execute(
-            "MATCH (a:Entity {uuid: $uid})-[r:Relation]->(b:Entity) "
-            "WHERE r.superseded_at IS NULL "
-            "RETURN b.uuid, b.name, r.relation, r.weight",
-            parameters={"uid": uuid},
-        )
-        edges_in = await conn.execute(
-            "MATCH (a:Entity)-[r:Relation]->(b:Entity {uuid: $uid}) "
-            "WHERE r.superseded_at IS NULL "
-            "RETURN a.uuid, a.name, r.relation, r.weight",
-            parameters={"uid": uuid},
-        )
-
-        out_lines, in_lines = [], []
-        while edges_out.has_next():
-            row = edges_out.get_next()
-            out_lines.append(f"  →[{row[2]}]→ {row[1]} ({row[0][:8]}) weight={row[3]}")
-        while edges_in.has_next():
-            row = edges_in.get_next()
-            in_lines.append(f"  ←[{row[2]}]← {row[1]} ({row[0][:8]}) weight={row[3]}")
-
-        lines = [
-            f"Entity: {data.get('e.name')} [{data.get('e.entity_type')}]",
-            f"uuid: {uuid}",
-            f"description: {data.get('e.description')}",
-            f"pinned: {data.get('e.pinned')}  priority: {data.get('e.priority')}",
-        ]
-        if out_lines:
-            lines.append("outgoing:")
-            lines.extend(out_lines)
-        if in_lines:
-            lines.append("incoming:")
-            lines.extend(in_lines)
-        return "\n".join(lines)
-
-    for fn in [find_entity, get_entity]:
-        tools.append({"fn": fn, "name": fn.__name__, "doc": fn.__doc__})
-    return tools
-
-
-# ---------------------------------------------------------------------------
-# Minimal agent loop
+# Agent loop
 # ---------------------------------------------------------------------------
 
 async def _agent_loop(
     llm,
     system_prompt: str,
     user_prompt: str,
-    tools: list[dict],
+    handler,
     agent_logger: logging.Logger,
     max_cycles: int = 20,
 ) -> None:
-    import inspect
     from TinyCTX.ai import TextDelta, ToolCallAssembled, LLMError
 
-    tool_defs = []
-    tool_map  = {}
-    for t in tools:
-        sig   = inspect.signature(t["fn"])
-        props: dict = {}
-        required: list = []
-        for pname, param in sig.parameters.items():
-            ann   = param.annotation
-            ptype = (
-                "integer" if ann is int else
-                "number"  if ann is float else
-                "boolean" if ann is bool else
-                "string"
-            )
-            props[pname] = {"type": ptype, "description": ""}
-            if param.default is inspect.Parameter.empty:
-                required.append(pname)
-        tool_defs.append({
-            "type": "function",
-            "function": {
-                "name":        t["name"],
-                "description": (t["doc"] or "").strip().split("\n\n")[0][:200],
-                "parameters":  {"type": "object", "properties": props, "required": required},
-            },
-        })
-        tool_map[t["name"]] = t["fn"]
-
-    messages = [
+    tool_defs = handler.get_tool_definitions(caller_level=25)
+    messages  = [
         {"role": "system", "content": system_prompt},
         {"role": "user",   "content": user_prompt},
     ]
@@ -690,7 +369,6 @@ async def _agent_loop(
                 return
 
         response_text = "".join(text_chunks)
-
         if response_text:
             label = "[final]" if not tool_calls else f"[cycle {cycle}]"
             agent_logger.info("%s %s", label, response_text)
@@ -712,16 +390,11 @@ async def _agent_loop(
         })
 
         for tc in tool_calls:
-            fn = tool_map.get(tc["name"])
-            if fn is None:
-                result = f"[unknown tool: {tc['name']}]"
-            else:
-                try:
-                    result = await fn(**tc["args"])
-                except Exception as exc:
-                    result = f"[error: {exc}]"
-                    logger.warning("[memory/librarian] tool %s error: %s", tc["name"], exc)
-
+            outcome = await handler.execute_tool_call(
+                {"id": tc["id"], "function": {"name": tc["name"], "arguments": tc["args"]}},
+                caller_level=25,
+            )
+            result = outcome["result"] if outcome["success"] else outcome["error"]
             agent_logger.debug("  tool %s → %s", tc["name"], result)
             messages.append({
                 "role":         "tool",

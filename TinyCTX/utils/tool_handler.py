@@ -2,8 +2,6 @@ import asyncio
 import functools
 import inspect
 import json
-import math
-import re
 from typing import Dict, Any, Callable, List, Optional
 
 class ToolCallHandler:
@@ -67,7 +65,6 @@ class ToolCallHandler:
             return (f"Function: {func.__name__}", {})
 
         lines = doc.strip().splitlines()
-        description_lines = []
         arg_descs = {}
         in_args = False
         main_line = None
