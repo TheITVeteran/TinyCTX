@@ -355,21 +355,38 @@ def register_agent(agent) -> None:
     # 5. call_librarian (always-on) — puts directly onto runner.queue
     # ------------------------------------------------------------------
 
-    async def call_librarian(prompt: str = "") -> str:
+    async def call_librarian(prompt: str = "", file_path: str = "") -> str:
         """
-        Signal the librarian to update the knowledge graph. Call with empty prompt if no specific fact to store, or there are many facts to store.
+        Signal the librarian to update the knowledge graph.
 
-        With no prompt: trigger normal node ingest immediately.
+        With no arguments: trigger normal conversation node ingest immediately.
 
-        With a prompt: spawn a targeted agent to execute that specific
-        graph-edit instruction (e.g. "remember that Kamie prefers async Python",
-        "update the TinyCTX project description", "link TinyCTX to Python").
+        With prompt only: spawn a targeted agent for that specific graph-edit
+        instruction (e.g. "remember that Kamie prefers async Python").
+
+        With file_path: read that file and ingest its contents into the graph.
+        One file per call. Combine with prompt for extra instructions
+        (e.g. file_path="notes.md", prompt="focus on the people mentioned").
 
         Args:
             prompt: Optional instruction for the targeted librarian agent.
-                Leave empty to trigger node ingest.
+            file_path: Optional path to a plain-text or markdown file to ingest.
+                Absolute, or relative to the workspace root.
         """
-        if prompt.strip():
+        if file_path.strip():
+            p = Path(file_path.strip())
+            if not p.is_absolute():
+                p = workspace / p
+            try:
+                file_text = p.read_text(encoding="utf-8", errors="replace")
+            except Exception as exc:
+                return f"[librarian: could not read '{file_path}': {exc}]"
+            combined = f"<file name=\"{p.name}\">\n{file_text}\n</file>"
+            if prompt.strip():
+                combined = f"{combined}\n\n{prompt.strip()}"
+            runner.queue.put_nowait({"type": "targeted", "prompt": combined})
+            return f"[librarian: file agent queued — '{p.name}']"
+        elif prompt.strip():
             runner.queue.put_nowait({"type": "targeted", "prompt": prompt.strip()})
             return f"[librarian: targeted agent queued — '{prompt[:60]}']"
         else:
