@@ -168,7 +168,7 @@ class AgentCycle:
                         is_error=True,
                     )
 
-                self.context.add(HistoryEntry.tool_result(result))
+                self.context.add_tool_result(result)
                 meta["tail_node_id"] = self.context.tail_node_id
                 
                 yield AgentToolResult(
@@ -278,7 +278,7 @@ class AgentCycle:
                     return ToolResult(
                         call_id=call.call_id,
                         tool_name=call.tool_name,
-                        output=f"[image/{mime} — see attached image below]",
+                        output=f"[{mime} — see attached image below]",
                         is_error=False,
                         is_image=True,
                         image_mime=mime,

@@ -289,6 +289,25 @@ class Context:
         self.dialogue.append(entry)
         return entry
 
+    def add_tool_result(self, result: ToolResult) -> None:
+        """
+        Write a tool result into the context.  If the result carries image
+        data (is_image=True), a synthetic user turn containing an image_url
+        content block is appended immediately after the tool node so the
+        model sees the image on the next inference pass.
+
+        This is necessary because OpenAI-compat APIs do not support image
+        content in tool-role messages.
+        """
+        self.add(HistoryEntry.tool_result(result))
+
+        if result.is_image and result.image_mime and result.image_b64:
+            image_block: list[dict] = [{
+                "type": "image_url",
+                "image_url": {"url": f"data:{result.image_mime};base64,{result.image_b64}"},
+            }]
+            self.add(HistoryEntry(role=ROLE_USER, content=image_block))
+
     def clear(self) -> None:
         self.dialogue.clear()
         self.state.clear()
