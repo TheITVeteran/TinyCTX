@@ -59,7 +59,7 @@ def register_agent(cycle) -> None:
     for key, cfg_key, priority_key in (
         ("soul",   "soul_file",   "soul_priority"),
         ("agents", "agents_file", "agents_priority"),
-        ("memory", "memory_file", "memory_priority"),
+        # ("memory", "memory_file", "memory_priority"),
         ("tools",  "tools_file",  "tools_priority"),
     ):
         path = _resolve(cfg[cfg_key])

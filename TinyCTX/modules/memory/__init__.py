@@ -1,5 +1,5 @@
-EXTENSION_META = {
-    "name":    "knowledge",
+﻿EXTENSION_META = {
+    "name":    "memory",
     "version": "0.2",
     "description": (
         "Long-term memory backed by a LadybugDB property graph. "
@@ -11,8 +11,8 @@ EXTENSION_META = {
     ),
     "default_config": {
         # Paths (relative to workspace)
-        "graph_path":    "knowledge/graph.lbug",
-        "librarian_log": "knowledge/librarian.log",
+        "graph_path":    "memory/graph.lbug",
+        "librarian_log": "memory/librarian.log",
 
         # Librarian trigger config
         "trigger_interval_hours": 6,

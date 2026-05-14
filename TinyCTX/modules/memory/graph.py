@@ -1,5 +1,5 @@
-"""
-modules/knowledge/graph.py
+﻿"""
+modules/memory/graph.py
 
 LadybugDB schema initialisation and low-level graph access helpers.
 (LadybugDB is the community-maintained fork of KùzuDB.)
@@ -40,7 +40,6 @@ import logging
 import math
 import time
 import uuid
-from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -101,13 +100,6 @@ ENTITY_TYPES = {
     "Organization", "Project", "Technology", "Rule", "Directive", "Role",
 }
 
-RELATION_VOCAB = {
-    "LIKES", "DISLIKES", "USES", "CREATED", "DEPENDS_ON", "CONFLICTS_WITH",
-    "PRECEDED_BY", "SUPERSEDES", "IS_A", "INSTANCE_OF", "MEMBER_OF",
-    "LOCATED_IN", "WORKED_ON", "KNOWS", "RELATED_TO", "ALIASED_TO",
-    "MERGED_INTO",
-}
-
 
 # ---------------------------------------------------------------------------
 # Schema init
@@ -121,7 +113,7 @@ def init_schema(conn) -> None:
     """
     for ddl in _SCHEMA_DDL:
         conn.execute(ddl.strip())
-    logger.info("[knowledge/graph] schema initialised")
+    logger.info("[memory/graph] schema initialised")
 
 
 # ---------------------------------------------------------------------------
