@@ -547,19 +547,6 @@ async def _dynamic_discovery(agent) -> list[dict]:
         }
     """, [ignore_tags, max_elements])
 
-
-def _web_prompt(_ctx) -> str:
-    return (
-        "<web_tools>\n"
-        "- Use web_search when you need discovery, current information, or you do not yet have a URL.\n"
-        "- Use open_url when you have a specific URL. Returns text by default; use type='elements' when you need to click/type/interact, or type='html' for raw markup.\n"
-        "- If open_url returns a captcha or login wall, retry with headless=False so the browser window becomes visible.\n"
-        "- Use click, type_text, wait_for, extract_text, extract_html, or screenshot after open_url(type='elements') to interact with the loaded page.\n"
-        "- Do not use shell with curl, wget, Invoke-WebRequest, or similar commands for normal web fetching.\n"
-        "</web_tools>"
-    )
-
-
 # ---------------------------------------------------------------------------
 # register() — wires everything into agent
 # ---------------------------------------------------------------------------

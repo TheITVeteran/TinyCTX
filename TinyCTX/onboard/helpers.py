@@ -11,9 +11,9 @@ import platform
 import subprocess
 import urllib.request
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
-import questionary
+
 import yaml
 from questionary import Style
 from rich.console import Console
