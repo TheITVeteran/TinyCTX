@@ -365,13 +365,9 @@ def load(path="config.yaml") -> Config:
 
     # ------------------------------------------------------------------ workspace
     ws_raw = raw.get("workspace", {})
-    # Legacy fallback: if old 'memory.workspace_path' key is present and
-    # the new 'workspace' key is absent, migrate transparently.
-    if not ws_raw:
-        legacy_path = raw.get("memory", {}).get("workspace_path")
-        if legacy_path:
-            ws_raw = {"path": legacy_path}
-    workspace = WorkspaceConfig(path=ws_raw.get("path") or "~")
+    workspace = WorkspaceConfig(
+        path=Path(ws_raw.get("path") or "~").expanduser()
+    )
 
     # ------------------------------------------------------------------ rest
     router_raw = raw.get("router", {})
