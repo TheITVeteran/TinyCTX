@@ -19,7 +19,7 @@ from __future__ import annotations
 import importlib
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from TinyCTX.agent import AgentCycle
@@ -40,7 +40,7 @@ class ModuleRegistry:
     """
 
     def __init__(self) -> None:
-        self._agent_registrations: list[callable] = []
+        self._agent_registrations: list[Callable] = []
 
     def load_modules(self, runtime) -> None:
         """Scan modules/ and call register_runtime on each."""

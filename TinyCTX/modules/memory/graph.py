@@ -142,8 +142,11 @@ def embed_content_for(name: str, description: str) -> str:
 # Cosine similarity (same pattern as memory/store.py)
 # ---------------------------------------------------------------------------
 
-try:
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
     import numpy as _np
+try:
+    import numpy as _np  # type: ignore[no-redef]
     _NUMPY = True
 except ImportError:
     _NUMPY = False
