@@ -617,7 +617,7 @@ class DiscordBridge:
         """Handle the /reset slash command."""
         channel = interaction.channel
         is_dm   = isinstance(channel, discord.DMChannel)
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
         user_id = interaction.user.id
 
         if not is_dm and not self._is_admin(user_id):
