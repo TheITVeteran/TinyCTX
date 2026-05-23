@@ -379,6 +379,26 @@ def register_runtime(runtime) -> None:
 
     _runner.start()
 
+    # Register /memory librarian slash command
+    async def _cmd_librarian(args: list, context: dict) -> None:
+        """
+        /memory librarian [prompt]
+
+        With no args: trigger an immediate node-ingest pass.
+        With args: queue a targeted agent with the joined args as the prompt.
+          e.g. /memory librarian remember that Alice prefers dark mode
+        """
+        prompt = " ".join(args).strip()
+        result = await call_librarian(prompt=prompt)
+        send = context.get("send")
+        if callable(send):
+            await send(result)
+
+    runtime.commands.register(
+        "memory", "librarian", _cmd_librarian,
+        help="Trigger the memory librarian. Optional: pass a prompt for a targeted update.",
+    )
+
     logger.info(
         "[memory] ready — graph: %s | embedder: %s",
         graph_path, embedding_model or "none",
