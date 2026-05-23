@@ -85,9 +85,17 @@ class ToolCallHandler:
 
     def _python_type_to_json_schema(self, annotation) -> Dict[str, Any]:
         import typing
+        import types
 
         origin = getattr(annotation, '__origin__', None)
         args   = getattr(annotation, '__args__', None)
+
+        # Handle Python 3.10+ `X | Y` union syntax (types.UnionType)
+        if isinstance(annotation, types.UnionType):
+            non_none = [a for a in annotation.__args__ if a is not type(None)]
+            if len(non_none) == 1:
+                return self._python_type_to_json_schema(non_none[0])
+            return {"type": "string"}
 
         # list[X]
         if origin is list:
