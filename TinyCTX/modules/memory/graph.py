@@ -382,10 +382,31 @@ class GraphDB:
         return all_edges
 
     def get_stats(self) -> dict:
-        entity_count = self.safe_execute("MATCH (e:Entity) RETURN count(e)").get_next()[0]
-        edge_count   = self.safe_execute(
+        entity_count = self.safe_execute(
+            "MATCH (e:Entity) RETURN count(e)"
+        ).get_next()[0]
+
+        edge_count = self.safe_execute(
             "MATCH ()-[r:Relation]->() WHERE r.superseded_at IS NULL RETURN count(r)"
         ).get_next()[0]
+
+        superseded_edge_count = self.safe_execute(
+            "MATCH ()-[r:Relation]->() WHERE r.superseded_at IS NOT NULL RETURN count(r)"
+        ).get_next()[0]
+
+        pinned_count = self.safe_execute(
+            "MATCH (e:Entity) WHERE e.pinned = true RETURN count(e)"
+        ).get_next()[0]
+
+        avg_priority_row = self.safe_execute(
+            "MATCH (e:Entity) RETURN avg(e.priority)"
+        ).get_next()[0]
+        avg_priority = round(float(avg_priority_row), 1) if avg_priority_row is not None else 0.0
+
+        embedded_count = self.safe_execute(
+            "MATCH (e:Entity) WHERE e.embedding IS NOT NULL RETURN count(e)"
+        ).get_next()[0]
+
         r = self.safe_execute(
             "MATCH (e:Entity) RETURN e.entity_type, count(e) ORDER BY count(e) DESC"
         )
@@ -393,10 +414,27 @@ class GraphDB:
         while r.has_next():
             row = r.get_next()
             by_type[row[0]] = row[1]
+
+        # Most-mentioned entities (top 5)
+        r2 = self.safe_execute(
+            "MATCH (e:Entity) WHERE e.mention_count > 0 "
+            "RETURN e.name, e.entity_type, e.mention_count "
+            "ORDER BY e.mention_count DESC LIMIT 5"
+        )
+        top_mentioned: list[dict] = []
+        while r2.has_next():
+            row = r2.get_next()
+            top_mentioned.append({"name": row[0], "entity_type": row[1], "mention_count": row[2]})
+
         return {
-            "entity_count": entity_count,
-            "active_edge_count": edge_count,
-            "by_type": by_type,
+            "entity_count":           entity_count,
+            "active_edge_count":      edge_count,
+            "superseded_edge_count":  superseded_edge_count,
+            "pinned_count":           pinned_count,
+            "avg_priority":           avg_priority,
+            "embedded_count":         embedded_count,
+            "by_type":                by_type,
+            "top_mentioned":          top_mentioned,
         }
 
     def all_entities_with_embeddings(self) -> list[tuple[str, list[float]]]:
