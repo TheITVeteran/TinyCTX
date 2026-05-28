@@ -38,14 +38,16 @@ types are created from the same underlying Database object.
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import logging
 import math
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any as _QueryResult  # placeholder for ladybug QueryResult
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +149,6 @@ def embed_content_for(name: str, description: str) -> str:
 # Cosine similarity
 # ---------------------------------------------------------------------------
 
-from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import numpy as _np
 try:
@@ -383,7 +384,7 @@ class GraphDB:
     # Safe execute — retries once after a mid-session WAL rebuild
     # ------------------------------------------------------------------
 
-    def safe_execute(self, query: str, parameters: dict | None = None):
+    def safe_execute(self, query: str, parameters: dict | None = None) -> Any:
         """
         Execute *query* on the current connection.
 
