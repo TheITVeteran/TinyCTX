@@ -32,9 +32,7 @@ class Runtime:
         self.module_registry = ModuleRegistry()
         self.users = UserStore()
 
-        # SSE / Event Routing
-        self._sse_queues: dict[str, list[asyncio.Queue]] = {}
-        self._cursor_handlers: dict[str, EventHandler] = {}
+        # Event Routing
         self._platform_handlers: dict[str, EventHandler] = {}
         self._node_platforms: dict[str, str] = {}
 
@@ -265,16 +263,7 @@ class Runtime:
         return delta
 
     async def _dispatch_event(self, node_id: str, event: AgentEvent) -> None:
-        # Prefer the event's own tail_node_id for cursor resolution if present,
-        # falling back to the original node_id used to spawn the cycle.
-        event_node_id = getattr(event, 'tail_node_id', None) or node_id
-
-        # 1. Direct SSE listeners — try event node first, then original
-        handler = self._cursor_handlers.get(event_node_id) or self._cursor_handlers.get(node_id)
-        if handler:
-            await handler(event)
-        
-        # 2. Platform-wide listeners (e.g. Discord Bridge)
+        # Platform-wide listeners (e.g. Discord Bridge)
         platform = self._node_platforms.get(node_id)
         for handler in self._platform_handlers.get(platform, []):
             await handler(event)

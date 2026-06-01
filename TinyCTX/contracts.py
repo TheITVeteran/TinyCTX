@@ -197,10 +197,10 @@ class AgentError(_AgentEventBase):
 @dataclass(frozen=True)
 class AgentOutboundFiles(_AgentEventBase):
     """
-    Emitted directly by the present() tool when the agent wants to deliver
-    files to the user. Bridges send each path as a file attachment.
-    Fired as a detached asyncio task from within the tool — agent.py is
-    never aware of it and receives a plain success string as the tool result.
+    Emitted by the present() tool when the agent wants to deliver files to
+    the user. Appended to agent.outbound_events and yielded immediately after
+    the AgentToolResult for that tool call, flowing through the normal event
+    stream like any other event. Bridges send each path as a file attachment.
     """
     paths: tuple[str, ...]
 

@@ -124,20 +124,6 @@ def _event_to_dict(event) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# SSE queue helpers  (Runtime owns the fanout; gateway just manages queues)
-# ---------------------------------------------------------------------------
-
-def _add_subscriber(node_id: str, runtime, queue: asyncio.Queue) -> None:
-    """Register queue with Runtime's fanout for node_id."""
-    runtime.register_sse_handler(node_id, queue)
-
-
-def _remove_subscriber(node_id: str, runtime, queue: asyncio.Queue) -> None:
-    """Deregister queue from Runtime's fanout. Cleans up cursor handler when last."""
-    runtime.unregister_sse_handler(node_id, queue)
-
-
-# ---------------------------------------------------------------------------
 # POST /v1/lane/open
 # ---------------------------------------------------------------------------
 
@@ -267,8 +253,6 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
         raise web.HTTPTooManyRequests(content_type="application/json",
                                       body=json.dumps({"error": "runtime at capacity"}))
 
-    _add_subscriber(new_tail, runtime, q)
-
     # Stream SSE response.
     response = web.StreamResponse(headers={
         "Content-Type":      "text/event-stream",
@@ -312,9 +296,6 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
 
     except asyncio.CancelledError:
         pass
-
-    finally:
-        _remove_subscriber(new_tail, runtime, q)
 
     await response.write_eof()
     return response

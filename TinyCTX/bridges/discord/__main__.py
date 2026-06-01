@@ -820,25 +820,13 @@ class DiscordBridge:
         return tuple(fetched)
 
     # ------------------------------------------------------------------
-    # Event handler registered with Runtime (kept for AgentOutboundFiles
-    # which is fired outside the normal turn queue by the present() tool)
+    # Event handler registered with Runtime (no longer used for
+    # AgentOutboundFiles — kept as a no-op in case other platform-wide
+    # events are added in future)
     # ------------------------------------------------------------------
 
     async def handle_event(self, event) -> None:
-        if isinstance(event, AgentOutboundFiles):
-            # AgentOutboundFiles is fired as a detached task from within the
-            # tool — it never goes through the per-turn queue. Route by looking
-            # up which cursor_key is currently active for this node.
-            cursor_key = self._node_to_cursor.get(event.tail_node_id)
-            channel    = self._active_channels.get(cursor_key) if cursor_key else None
-            if channel is None:
-                logger.warning("AgentOutboundFiles but no active channel for tail %s", event.tail_node_id)
-                return
-            for path in event.paths:
-                try:
-                    await channel.send(file=discord.File(path))
-                except Exception as exc:
-                    logger.warning("Discord: failed to upload file %s: %s", path, exc)
+        pass
 
     # ------------------------------------------------------------------
     # Discord callbacks
@@ -1167,6 +1155,12 @@ class DiscordBridge:
                             "Discord: tool result %s (%s) for %s",
                             event.tool_name, "error" if event.is_error else "ok", cursor_key,
                         )
+                    elif isinstance(event, AgentOutboundFiles):
+                        for path in event.paths:
+                            try:
+                                await channel.send(file=discord.File(path))
+                            except Exception as exc:
+                                logger.warning("Discord: failed to upload file %s: %s", path, exc)
                     elif isinstance(event, AgentError):
                         await channel.send(f"⚠️ {event.message}")
                         break
