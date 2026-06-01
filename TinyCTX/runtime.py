@@ -4,10 +4,9 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Awaitable, Callable
 
 from TinyCTX.config import Config
-from TinyCTX.contracts import AgentEvent, InboundMessage
+from TinyCTX.contracts import InboundMessage
 from TinyCTX.users import UserStore
 from TinyCTX.utils.attachments import build_content_blocks as _build_content_blocks
 from TinyCTX.db import ConversationDB
@@ -15,8 +14,6 @@ from TinyCTX.utils.commands import CommandRegistry
 from TinyCTX.module_registry import ModuleRegistry
 
 logger = logging.getLogger(__name__)
-
-EventHandler = Callable[[AgentEvent], Awaitable[None]]
 
 class Runtime:
     def __init__(self, config: Config) -> None:
@@ -31,10 +28,6 @@ class Runtime:
         self.commands = CommandRegistry()
         self.module_registry = ModuleRegistry()
         self.users = UserStore()
-
-        # Event Routing
-        self._platform_handlers: dict[str, EventHandler] = {}
-        self._node_platforms: dict[str, str] = {}
 
         # Concurrency Management
         max_workers = getattr(config, "max_workers", 8)
@@ -191,10 +184,6 @@ class Runtime:
         
         new_tail_id = user_node.id
 
-        # Track platform under the new user node id so _dispatch_event can route it.
-        platform_val = msg.author.identities[0].platform.value if msg.author.identities else "system"
-        self._node_platforms[new_tail_id] = platform_val
-
         # 4. Trigger Cycle if requested
         if not msg.trigger:
             return new_tail_id
@@ -231,7 +220,6 @@ class Runtime:
                 logger.debug("[runtime] cycle starting for node %s", node_id)
                 
                 async for event in agent.run(node_id, permission_level, abort_event):
-                    await self._dispatch_event(node_id, event)
                     if reply_queue is not None:
                         await reply_queue.put(event)
                 
@@ -262,21 +250,12 @@ class Runtime:
                 delta[k] = v
         return delta
 
-    async def _dispatch_event(self, node_id: str, event: AgentEvent) -> None:
-        # Platform-wide listeners (e.g. Discord Bridge)
-        platform = self._node_platforms.get(node_id)
-        for handler in self._platform_handlers.get(platform, []):
-            await handler(event)
-
     def _get_abort_event(self, node_id: str) -> asyncio.Event:
         ev = self._abort_events.get(node_id) or asyncio.Event()
         ev.clear()
         self._abort_events[node_id] = ev
         return ev
     
-    def register_platform_handler(self, platform: str, handler: EventHandler) -> None:
-        self._platform_handlers.setdefault(platform, []).append(handler)
-        
     def abort(self, node_id: str) -> bool:
         if node_id in self._abort_events:
             self._abort_events[node_id].set()

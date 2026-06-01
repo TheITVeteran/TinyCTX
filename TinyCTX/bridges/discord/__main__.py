@@ -820,15 +820,6 @@ class DiscordBridge:
         return tuple(fetched)
 
     # ------------------------------------------------------------------
-    # Event handler registered with Runtime (no longer used for
-    # AgentOutboundFiles — kept as a no-op in case other platform-wide
-    # events are added in future)
-    # ------------------------------------------------------------------
-
-    async def handle_event(self, event) -> None:
-        pass
-
-    # ------------------------------------------------------------------
     # Discord callbacks
     # ------------------------------------------------------------------
 
@@ -1198,7 +1189,6 @@ class DiscordBridge:
                 "Export your bot token before starting."
             )
 
-        self._runtime.register_platform_handler(Platform.DISCORD.value, self.handle_event)
         logger.info("Discord bridge: starting (token_env=%s)", token_env)
         await self._client.start(token)
 
