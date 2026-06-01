@@ -78,6 +78,8 @@ class Runtime:
                 )
             return None
 
+        from TinyCTX.users import UsernameConflictError
+
         async def _cmd_grant(args: list[str], context: dict) -> None:
             send = context["send"]
             if len(args) < 2:
@@ -140,7 +142,6 @@ class Runtime:
             if caller is None or caller.permission_level < 100:
                 await send("⛔ Permission denied. Requires level 100.")
                 return
-            from TinyCTX.users import UsernameConflictError
             try:
                 updated = users.rename_user(args[0], args[1])
                 await send(f"✅ Renamed {args[0]!r} → {updated.username!r}")

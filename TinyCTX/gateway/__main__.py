@@ -221,16 +221,30 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
     permission_level = int(body.get("permission_level", 25))
     permission_level = max(0, min(100, permission_level))  # clamp to 0-100
 
-    api_user = runtime.users.resolve_user(
-        platform=Platform.API,
-        user_id="api-client",
-        username="api",
-        display_name="API Client",
-    )
+    # If a cli_username is present, the request came from a CLI session.
+    # Resolve the named user from users.db and author the message as them.
+    # The gateway trusts this field because CLI access requires the gateway
+    # api_key — same physical-access trust model as the launch command.
+    cli_username = (body.get("cli_username") or "").strip()
+    if cli_username:
+        cli_user = runtime.users.get_user(cli_username)
+        if cli_user is None:
+            raise web.HTTPBadRequest(
+                content_type="application/json",
+                body=json.dumps({"error": f"cli_username {cli_username!r} not found"}),
+            )
+        author = cli_user
+    else:
+        author = runtime.users.resolve_user(
+            platform=Platform.API,
+            user_id="api-client",
+            username="api",
+            display_name="API Client",
+        )
 
     msg = InboundMessage(
         tail_node_id=node_id,
-        author=api_user,
+        author=author,
         content_type=content_type_for(text, bool(attachments)),
         text=text,
         message_id=str(time.time_ns()),

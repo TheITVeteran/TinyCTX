@@ -10,7 +10,26 @@ Default config path: <repo_root>/config.yaml. Override with --config.
 
 Flags
 -----
-  --config PATH  Path to config.yaml.
+  --config PATH    Path to config.yaml.
+  --user USERNAME  TinyCTX username to log in as. If the user's
+                   permission_level is below 100, you will be prompted
+                   to elevate it (CLI is a trusted admin console — no
+                   higher-level caller is required).
+
+Docker
+------
+When TinyCTX is running inside a container, attach to the container and
+run this command from within it:
+
+    docker exec -it <container_name> python -m TinyCTX launch cli --user USERNAME
+
+Or, if you have the TinyCTX CLI installed on the host and the gateway
+port is published (e.g. -p 8085:8085), just run:
+
+    tinyctx launch cli --user USERNAME
+
+and point it at the published port — no docker exec needed because the
+CLI bridge connects to the gateway over HTTP, not a Unix socket.
 """
 from __future__ import annotations
 
@@ -21,6 +40,25 @@ from pathlib import Path
 
 _REPO_ROOT      = Path(__file__).resolve().parent.parent.parent
 _DEFAULT_CONFIG = _REPO_ROOT / "config.yaml"
+
+
+def _prompt_elevate(username: str, current_level: int) -> bool:
+    """Ask the user if they want to elevate to level 100. Returns True if yes."""
+    print(
+        f"\n  User '{username}' has permission_level {current_level}.\n"
+        "  The CLI is a trusted admin console — you can elevate this user to\n"
+        "  level 100 now. This grants full access to all agent capabilities.\n"
+    )
+    while True:
+        try:
+            answer = input("  Elevate to level 100? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("", "n", "no"):
+            return False
+        print("  Please enter y or n.")
 
 
 def run(args: argparse.Namespace) -> None:
@@ -54,6 +92,40 @@ def run(args: argparse.Namespace) -> None:
         print(f"error: gateway at {gateway_url} is not responding: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    # ── Resolve user ──────────────────────────────────────────────────────────
+    username: str | None = getattr(args, "user", None)
+
+    from TinyCTX.users import UserStore
+    store = UserStore()
+
+    if username is None:
+        # No --user flag: prompt interactively.
+        try:
+            username = input("  TinyCTX username: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nCancelled.")
+            sys.exit(0)
+
+    if not username:
+        print("error: username cannot be empty.", file=sys.stderr)
+        sys.exit(1)
+
+    user = store.get_user(username)
+    if user is None:
+        print(f"error: user '{username}' not found in users.db.", file=sys.stderr)
+        print("  Check the username with: python -m TinyCTX.onboard.fix_permissions --user <name> --list", file=sys.stderr)
+        sys.exit(1)
+
+    # ── Offer elevation if level < 100 ────────────────────────────────────────
+    if user.permission_level < 100:
+        if _prompt_elevate(username, user.permission_level):
+            from TinyCTX.onboard.fix_permissions import elevate_user
+            user = elevate_user(username, 100, store)
+            print(f"  ✓ '{username}' elevated to level 100.\n")
+        else:
+            print(f"  Continuing as level {user.permission_level}.\n")
+
+    # ── Launch CLI ────────────────────────────────────────────────────────────
     options: dict = {}
     try:
         bridge_cfg = cfg.bridges.get("cli")
@@ -65,6 +137,6 @@ def run(args: argparse.Namespace) -> None:
     import asyncio
     from TinyCTX.bridges.cli.__main__ import run_detached
     try:
-        asyncio.run(run_detached(gateway_url, api_key, options))
+        asyncio.run(run_detached(gateway_url, api_key, options, username=username))
     except KeyboardInterrupt:
         pass
