@@ -301,10 +301,14 @@ def register_agent(agent) -> None:
     def shell(command: str, timeout: int | None = None) -> str:
         """Run a shell command in the isolated sandbox container.
 
-        The sandbox has full internet access but cannot reach the local
-        network, Tailscale, or the host. Use this for the vast majority
-        of shell work: building, running scripts, calling APIs, git, etc.
+        The sandbox has outbound internet access (HTTP/S, git, pip, npm, etc.)
+        but is NETWORK-ISOLATED: it cannot reach the local LAN, Tailscale
+        peers, internal services, or the host. Use this for the vast majority
+        of shell work: building, running scripts, calling public APIs, git, etc.
         Blocked commands return an error string without executing.
+
+        For anything that needs to reach a private/local address (e.g.
+        Tailscale IPs, LAN services, ComfyUI, internal APIs) use core_shell.
 
         Args:
             command: The shell command to run.
@@ -315,15 +319,20 @@ def register_agent(agent) -> None:
         return _dispatch(command, call_timeout=timeout)
 
     def core_shell(command: str, timeout: int | None = None) -> str:
-        """Run a shell command directly on the core host (NOT sandboxed).
+        """Run a shell command in the main TinyCTX container (NOT the sandbox).
 
-        Has full access to the local network, Tailscale, and host resources.
-        Reserved for operations that specifically require host-level access:
-        managing services, writing to host paths, Tailscale operations, etc.
+        Has full network access: LAN, Tailscale peers, internal services, and
+        the host. Use this whenever the command needs to reach a private or
+        local address — for example:
+          - Tailscale IPs (100.x.x.x)
+          - LAN services (192.168.x.x, 10.x.x.x)
+          - Internal APIs (ComfyUI, local databases, self-hosted services)
+          - Docker host or sibling containers by hostname
+
         Requires permission level 100. Blacklist still applies.
 
         Args:
-            command: The shell command to run on the host.
+            command: The shell command to run.
             timeout: Optional per-call timeout in seconds. Capped at the
                      configured maximum (default 1200s).
         """
