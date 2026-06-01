@@ -151,7 +151,6 @@ from TinyCTX.contracts import (
     content_type_for,
     InboundMessage,
     Platform,
-    UserIdentity,
 )
 
 if TYPE_CHECKING:
@@ -900,10 +899,11 @@ class DiscordBridge:
                 return
 
             cursor_key = f"dm:{message.author.id}"
-            author     = UserIdentity(
+            author     = self._runtime.users.resolve_user(
                 platform=Platform.DISCORD,
                 user_id=str(message.author.id),
                 username=message.author.name,
+                display_name=message.author.display_name,
             )
             msg = InboundMessage(
                 tail_node_id="",
@@ -915,7 +915,6 @@ class DiscordBridge:
                 attachments=attachments,
                 server_name=None,
                 channel_name=None,
-                permission_level=self._opts.get("dm_permission", 25),
                 trigger=True,
             )
             task = asyncio.create_task(
@@ -959,10 +958,11 @@ class DiscordBridge:
         if not text and not attachments:
             return
 
-        author       = UserIdentity(
+        author       = self._runtime.users.resolve_user(
             platform=Platform.DISCORD,
             user_id=str(message.author.id),
             username=message.author.name,
+            display_name=message.author.display_name,
         )
         member_roles = getattr(message.author, "roles", None)
         is_trigger   = self._is_group_trigger(text)
@@ -976,7 +976,6 @@ class DiscordBridge:
             attachments=attachments,
             server_name=message.guild.name if message.guild else None,
             channel_name=getattr(message.channel, "name", None),
-            permission_level=self._resolve_permission_level(member_roles),
             trigger=is_trigger,
         )
 
@@ -1042,10 +1041,11 @@ class DiscordBridge:
         if not text and not attachments:
             return
 
-        author  = UserIdentity(
+        author  = self._runtime.users.resolve_user(
             platform=Platform.DISCORD,
             user_id=str(message.author.id),
             username=message.author.name,
+            display_name=message.author.display_name,
         )
         member_roles = getattr(message.author, "roles", None)
         # Ensure the thread cursor exists (fork logic lives in _get_or_create_thread_cursor)
@@ -1061,7 +1061,6 @@ class DiscordBridge:
             attachments=attachments,
             server_name=message.guild.name if message.guild else None,
             channel_name=getattr(thread, "name", None),
-            permission_level=self._resolve_permission_level(member_roles),
             trigger=True,
         )
         task = asyncio.create_task(

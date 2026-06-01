@@ -8,6 +8,7 @@ from typing import Awaitable, Callable
 
 from TinyCTX.config import Config
 from TinyCTX.contracts import AgentEvent, InboundMessage
+from TinyCTX.users import UserStore
 from TinyCTX.utils.attachments import build_content_blocks as _build_content_blocks
 from TinyCTX.db import ConversationDB
 from TinyCTX.utils.commands import CommandRegistry
@@ -29,6 +30,7 @@ class Runtime:
 
         self.commands = CommandRegistry()
         self.module_registry = ModuleRegistry()
+        self.users = UserStore()
 
         # SSE / Event Routing
         self._sse_queues: dict[str, list[asyncio.Queue]] = {}
@@ -79,15 +81,16 @@ class Runtime:
             parent_id=msg.tail_node_id,
             role="user",
             content=content_str,
-            author_id=msg.author.user_id,
-            author_name=msg.author.username,
+            author_id=msg.author.username,
+            author_name=None,
             state_delta=json.dumps(state_delta) if state_delta else None,
         )
         
         new_tail_id = user_node.id
 
         # Track platform under the new user node id so _dispatch_event can route it.
-        self._node_platforms[new_tail_id] = msg.author.platform.value
+        platform_val = msg.author.identities[0].platform.value if msg.author.identities else "system"
+        self._node_platforms[new_tail_id] = platform_val
 
         # 4. Trigger Cycle if requested
         if not msg.trigger:
@@ -103,7 +106,7 @@ class Runtime:
         # Spawn Task
         abort_ev = self._get_abort_event(new_tail_id)
         task = asyncio.create_task(
-            self._process(new_tail_id, msg.permission_level, abort_ev, reply_queue),
+            self._process(new_tail_id, msg.author.permission_level, abort_ev, reply_queue),
             name=f"cycle:{new_tail_id}"
         )
         self._tasks.add(task)
@@ -146,9 +149,8 @@ class Runtime:
         prior_state, _ = self.db.load_session_state(msg.tail_node_id)
         delta = {}
         mapping = {
-            "platform": msg.author.platform.value,
-            "author_id": msg.author.user_id,
-            "permission_level": msg.permission_level,
+            "platform": msg.author.identities[0].platform.value if msg.author.identities else None,
+            "author_id": msg.author.username,
             "server_name": msg.server_name,
             "channel_name": msg.channel_name
         }

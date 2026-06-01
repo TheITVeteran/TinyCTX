@@ -60,14 +60,12 @@ from aiohttp import web
 from TinyCTX.config import GatewayConfig
 from TinyCTX.contracts import (
     Platform, content_type_for,
-    UserIdentity, InboundMessage, Attachment,
+    InboundMessage, Attachment,
     AgentThinkingChunk, AgentTextChunk, AgentTextFinal,
     AgentToolCall, AgentToolResult, AgentError, AgentOutboundFiles,
 )
 
 logger = logging.getLogger(__name__)
-
-_API_AUTHOR = UserIdentity(platform=Platform.API, user_id="api-client", username="api")
 
 
 # ---------------------------------------------------------------------------
@@ -223,15 +221,21 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
     permission_level = int(body.get("permission_level", 25))
     permission_level = max(0, min(100, permission_level))  # clamp to 0-100
 
+    api_user = runtime.users.resolve_user(
+        platform=Platform.API,
+        user_id="api-client",
+        username="api",
+        display_name="API Client",
+    )
+
     msg = InboundMessage(
         tail_node_id=node_id,
-        author=_API_AUTHOR,
+        author=api_user,
         content_type=content_type_for(text, bool(attachments)),
         text=text,
         message_id=str(time.time_ns()),
         timestamp=time.time(),
         attachments=attachments,
-        permission_level=permission_level,
         trigger=True,
     )
 

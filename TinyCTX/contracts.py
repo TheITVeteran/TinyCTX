@@ -65,12 +65,13 @@ class AttachmentKind(str, Enum):
 # User identity
 # ---------------------------------------------------------------------------
 
+# NOTE: UserIdentity is deprecated. Use TinyCTX.users.User instead.
+# Kept here temporarily so existing imports don't break during transition.
 @dataclass(frozen=True)
 class UserIdentity:
     """
-    Who sent the message.
-    user_id is the stable per-platform identifier.
-    Bridges are responsible for supplying a consistent user_id.
+    Deprecated. Bridges now receive a User from UserStore.resolve_user().
+    TODO: remove once all bridges are migrated.
     """
     platform: Platform
     user_id:  str
@@ -115,7 +116,7 @@ class InboundMessage:
     channel_name  — human-readable channel or thread name; None for DMs
     """
     tail_node_id: str
-    author:       UserIdentity
+    author:       Any             # TinyCTX.users.User; typed as Any to avoid circular import
     content_type: ContentType
     text:         str
     message_id:   str
@@ -126,7 +127,7 @@ class InboundMessage:
     trace_id:     str           = field(default_factory=lambda: str(uuid.uuid4()))
     server_name:  str | None    = None          # guild/server name (bridges populate when known)
     channel_name: str | None    = None          # channel/thread name (bridges populate when known)
-    permission_level: int       = 25            # 0-100; bridge sets per triggering sender. CLI=100.
+    # permission_level removed — permissions live on User only (phase 2 enforcement)
 
 
 # ---------------------------------------------------------------------------
