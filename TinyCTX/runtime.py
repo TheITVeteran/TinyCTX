@@ -46,8 +46,112 @@ class Runtime:
         self._abort_events: dict[str, asyncio.Event] = {}
 
     async def start(self) -> None:
+        self._register_user_commands()
         self.module_registry.load_modules(self)
         logger.info("Runtime started")
+
+    def _register_user_commands(self) -> None:
+        """
+        Register /user grant and /user info slash commands.
+
+        /user grant <username> <level>  — set a user's permission_level (requires caller level 100)
+        /user info <username>           — show a user's stored info
+        /user rename <username> <new>   — rename a TinyCTX username (requires caller level 100)
+
+        Admin check: the invoker's own User is resolved from the context's
+        platform identity (interaction.user on Discord) and must have
+        permission_level == 100.  If context carries no resolvable identity,
+        the command is denied.
+        """
+        users = self.users
+
+        def _caller_user(context: dict):
+            """Return the invoking User, or None if unresolvable."""
+            from TinyCTX.contracts import Platform
+            interaction = context.get("interaction")
+            if interaction is not None:
+                return users.resolve_user(
+                    platform=Platform.DISCORD,
+                    user_id=str(interaction.user.id),
+                    username=interaction.user.name,
+                    display_name=interaction.user.display_name,
+                )
+            return None
+
+        async def _cmd_grant(args: list[str], context: dict) -> None:
+            send = context["send"]
+            if len(args) < 2:
+                await send("Usage: /user grant <username> <level>")
+                return
+            caller = _caller_user(context)
+            if caller is None:
+                await send("⛔ Cannot resolve your identity.")
+                return
+            target_username = args[0]
+            try:
+                level = int(args[1])
+            except ValueError:
+                await send(f"Invalid level {args[1]!r} — must be an integer.")
+                return
+            if not (0 <= level <= 100):
+                await send("Level must be between 0 and 100.")
+                return
+            if level > caller.permission_level:
+                await send(f"⛔ Cannot grant level {level} — your level is {caller.permission_level}.")
+                return
+            user = users.get_user(target_username)
+            if user is None:
+                await send(f"User {target_username!r} not found.")
+                return
+            old_level = user.permission_level
+            user.permission_level = level
+            users.update_user(user)
+            logger.info(
+                "[user] %s granted level %d to %s (was %d)",
+                caller.username, level, target_username, old_level,
+            )
+            await send(f"✅ {target_username}: {old_level} → {level}")
+
+        async def _cmd_info(args: list[str], context: dict) -> None:
+            send = context["send"]
+            if not args:
+                await send("Usage: /user info <username>")
+                return
+            user = users.get_user(args[0])
+            if user is None:
+                await send(f"User {args[0]!r} not found.")
+                return
+            identities = ", ".join(
+                f"{i.platform.value}:{i.user_id} ({i.username})"
+                for i in user.identities
+            ) or "none"
+            await send(
+                f"**{user.username}** — level {user.permission_level}\n"
+                f"Identities: {identities}\n"
+                f"Created: {user.created_at:.0f}"
+            )
+
+        async def _cmd_rename(args: list[str], context: dict) -> None:
+            send = context["send"]
+            if len(args) < 2:
+                await send("Usage: /user rename <username> <new_username>")
+                return
+            caller = _caller_user(context)
+            if caller is None or caller.permission_level < 100:
+                await send("⛔ Permission denied. Requires level 100.")
+                return
+            from TinyCTX.users import UsernameConflictError
+            try:
+                updated = users.rename_user(args[0], args[1])
+                await send(f"✅ Renamed {args[0]!r} → {updated.username!r}")
+            except ValueError as e:
+                await send(f"Error: {e}")
+            except UsernameConflictError:
+                await send(f"Username {args[1]!r} is already taken.")
+
+        self.commands.register("user", "grant",  _cmd_grant,  help="Set a user's permission level (admin only)")
+        self.commands.register("user", "info",   _cmd_info,   help="Show a user's stored identity and level")
+        self.commands.register("user", "rename",  _cmd_rename, help="Rename a TinyCTX username (admin only)")
 
     # ------------------------------------------------------------------
     # Entry Point: push()
