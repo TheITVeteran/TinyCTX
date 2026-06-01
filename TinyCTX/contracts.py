@@ -123,6 +123,7 @@ class InboundMessage:
     timestamp:    float
     trigger:      bool          = True          # bridge sets False for non-triggering group messages
     reply_to_id:  str | None    = None
+    reply_to_author: str | None = None          # display name of replied-to message author; None if replying to the assistant
     attachments:  tuple["Attachment", ...] = field(default_factory=tuple)
     trace_id:     str           = field(default_factory=lambda: str(uuid.uuid4()))
     server_name:  str | None    = None          # guild/server name (bridges populate when known)

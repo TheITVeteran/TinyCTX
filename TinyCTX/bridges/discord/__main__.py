@@ -884,6 +884,18 @@ class DiscordBridge:
                 username=message.author.name,
                 display_name=message.author.display_name,
             )
+            bot_id = self._client.user.id if self._client.user else None
+            ref = message.reference
+            resolved_dm = ref.resolved if ref else None
+            reply_to_author_dm: str | None = None
+            if isinstance(resolved_dm, discord.Message) and resolved_dm.author.id != bot_id:
+                resolved_user = self._runtime.users.resolve_user(
+                    platform=Platform.DISCORD,
+                    user_id=str(resolved_dm.author.id),
+                    username=resolved_dm.author.name,
+                    display_name=resolved_dm.author.display_name,
+                )
+                reply_to_author_dm = resolved_user.username
             msg = InboundMessage(
                 tail_node_id="",
                 author=author,
@@ -895,6 +907,7 @@ class DiscordBridge:
                 server_name=None,
                 channel_name=None,
                 trigger=True,
+                reply_to_author=reply_to_author_dm,
             )
             task = asyncio.create_task(
                 self._handle_turn(msg, message.channel, cursor_key)
@@ -945,6 +958,17 @@ class DiscordBridge:
         )
         member_roles = getattr(message.author, "roles", None)
         is_trigger   = self._is_group_trigger(text)
+        ref_group = message.reference
+        resolved_group = ref_group.resolved if ref_group else None
+        reply_to_author_group: str | None = None
+        if isinstance(resolved_group, discord.Message) and resolved_group.author.id != bot_id:
+            resolved_user_group = self._runtime.users.resolve_user(
+                platform=Platform.DISCORD,
+                user_id=str(resolved_group.author.id),
+                username=resolved_group.author.name,
+                display_name=resolved_group.author.display_name,
+            )
+            reply_to_author_group = resolved_user_group.username
         msg = InboundMessage(
             tail_node_id="",
             author=author,
@@ -956,6 +980,7 @@ class DiscordBridge:
             server_name=message.guild.name if message.guild else None,
             channel_name=getattr(message.channel, "name", None),
             trigger=is_trigger,
+            reply_to_author=reply_to_author_group,
         )
 
         compat_delay: float = self._compat.match(message) if message.webhook_id is None else 0.0
@@ -1030,6 +1055,18 @@ class DiscordBridge:
         # Ensure the thread cursor exists (fork logic lives in _get_or_create_thread_cursor)
         # but don't snapshot it — _handle_turn reads it under the lock.
         self._get_or_create_thread_cursor(thread_id, channel_id)
+        bot_id_thread = self._client.user.id if self._client.user else None
+        ref_thread = message.reference
+        resolved_thread = ref_thread.resolved if ref_thread else None
+        reply_to_author_thread: str | None = None
+        if isinstance(resolved_thread, discord.Message) and resolved_thread.author.id != bot_id_thread:
+            resolved_user_thread = self._runtime.users.resolve_user(
+                platform=Platform.DISCORD,
+                user_id=str(resolved_thread.author.id),
+                username=resolved_thread.author.name,
+                display_name=resolved_thread.author.display_name,
+            )
+            reply_to_author_thread = resolved_user_thread.username
         msg = InboundMessage(
             tail_node_id="",
             author=author,
@@ -1041,6 +1078,7 @@ class DiscordBridge:
             server_name=message.guild.name if message.guild else None,
             channel_name=getattr(thread, "name", None),
             trigger=True,
+            reply_to_author=reply_to_author_thread,
         )
         task = asyncio.create_task(
             self._handle_turn(msg, message.channel, cursor_key)

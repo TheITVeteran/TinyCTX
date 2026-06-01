@@ -228,6 +228,8 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
             display_name="API Client",
         )
 
+    reply_to_author = (body.get("reply_to_author") or "").strip() or None
+
     msg = InboundMessage(
         tail_node_id=node_id,
         author=author,
@@ -237,6 +239,7 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
         timestamp=time.time(),
         attachments=attachments,
         trigger=True,
+        reply_to_author=reply_to_author,
     )
 
     # Register SSE queue with Runtime before pushing so no events are missed.

@@ -160,13 +160,14 @@ class Runtime:
         workspace = Path(self.config.workspace.path).expanduser().resolve()
         primary_name = self.config.llm.primary
         model_cfg = self.config.models.get(primary_name)
+        effective_text = f"[Replying to {msg.reply_to_author}]\n{msg.text}" if msg.reply_to_author else msg.text
         content = _build_content_blocks(
-            text=msg.text,
+            text=effective_text,
             attachments=msg.attachments,
             model_cfg=model_cfg,
             att_cfg=self.config.attachments,
             workspace=workspace,
-        ) if msg.attachments else msg.text
+        ) if msg.attachments else effective_text
 
         # Serialise list content to JSON string for DB storage.
         content_str = json.dumps(content, ensure_ascii=False) if isinstance(content, list) else content

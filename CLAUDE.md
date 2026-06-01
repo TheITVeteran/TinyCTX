@@ -78,3 +78,4 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
     - Then start reading general files, before specific files.
     - Every ~8 files you read, write to the CODEBASE.md file, and mark off items in the TODO as done.
 - Always update CODEBASE.md when you make changes to the code.
+- Read CODEBASE.md to find where things are, it's faster than manually searching.
