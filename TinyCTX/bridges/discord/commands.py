@@ -120,7 +120,7 @@ async def handle_reset_interaction(
     await interaction.response.defer(ephemeral=False)
     user_id = interaction.user.id
 
-    if not is_dm and not bridge._is_admin(user_id):
+    if not is_dm and not bridge._can_reset(user_id):
         await interaction.followup.send(
             "⛔ Only admins can reset the session.", ephemeral=True
         )
@@ -150,9 +150,9 @@ async def handle_shutdown_interaction(
     """Handle the /shutdown slash command — kills the gateway process."""
     await interaction.response.defer(ephemeral=True)
 
-    if not bridge._is_admin(interaction.user.id):
+    if not bridge._can_reset(interaction.user.id):
         await interaction.followup.send(
-            "⛔ Only admins can shut down the gateway.", ephemeral=True
+            "? Only admins can shut down the gateway.", ephemeral=True
         )
         return
 

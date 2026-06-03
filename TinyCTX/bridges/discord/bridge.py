@@ -4,7 +4,7 @@ bridges/discord/bridge.py — DiscordBridge: event routing, access control,
 
 This is the central class. Responsibilities kept here:
   - discord.py client setup and event registration
-  - Access-control checks (allowed_users_dm, allowed_servers, admin_users)
+  - Access-control checks (allowed_servers, permission levels via user registry)
   - on_message routing (DM / group channel / thread)
   - Attachment + forwarded-message extraction
   - Cursor read/create/advance wrappers
@@ -56,10 +56,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULTS = {
     "token_env": "DISCORD_BOT_TOKEN",
-    "allowed_users_dm": [],
     "allowed_servers": {},
-    "admin_users": [],
     "dm_enabled": True,
+    "dm_requires_permission": 75,       # minimum user registry level to use the bot in DMs
+    "reset_requires_permission": 75,    # minimum user registry level to /reset in a server
     "prefix_required": True,
     "command_prefix": "!",
     "reset_command": "/reset",
@@ -110,9 +110,6 @@ class DiscordBridge:
         self._buffer_timeout_s:  float = float(self._opts["buffer_timeout_s"])
         self._buffer_head_lines: int   = int(self._opts["buffer_head_lines"])
         self._buffer_tail_lines: int   = int(self._opts["buffer_tail_lines"])
-
-        self._allowed_users_dm: set[int] = {int(u) for u in self._opts["allowed_users_dm"]}
-        self._admin_users:      set[int] = {int(u) for u in self._opts["admin_users"]}
 
         # In-flight state (not persisted)
         self._typing_active:    dict[str, asyncio.Event]          = {}
@@ -230,21 +227,19 @@ class DiscordBridge:
     # Permission helpers
     # ------------------------------------------------------------------
 
-    def _resolve_permission_level(self, member_roles: list | None) -> int:
-        role_map = self._opts.get("role_permissions", {})
-        default  = int(self._opts.get("default_permission", 25))
-        if not member_roles or not role_map:
-            return default
-        int_map = {int(k): int(v) for k, v in role_map.items()}
-        for role in sorted(member_roles, key=lambda r: r.position, reverse=True):
-            if role.id in int_map:
-                return int_map[role.id]
-        return default
+    def _user_permission_level(self, platform_user_id: int) -> int:
+        """Look up the TinyCTX user registry level for a Discord user id."""
+        user = self._runtime.users.resolve_user(
+            platform=Platform.DISCORD,
+            user_id=str(platform_user_id),
+            username="",
+            display_name="",
+        )
+        return user.permission_level
 
     def _is_allowed_dm(self, user_id: int) -> bool:
-        if not self._allowed_users_dm:
-            return True
-        return user_id in self._allowed_users_dm
+        required = int(self._opts["dm_requires_permission"])
+        return self._user_permission_level(user_id) >= required
 
     def _is_allowed_server(self, guild_id: int, channel_id: int) -> bool:
         if guild_id not in self._allowed_servers:
@@ -252,8 +247,9 @@ class DiscordBridge:
         allowed_channels = self._allowed_servers[guild_id]
         return not allowed_channels or channel_id in allowed_channels
 
-    def _is_admin(self, user_id: int) -> bool:
-        return user_id in self._admin_users
+    def _can_reset(self, user_id: int) -> bool:
+        required = int(self._opts["reset_requires_permission"])
+        return self._user_permission_level(user_id) >= required
 
     def _is_group_trigger(self, text: str) -> bool:
         if not self._prefix_required:
@@ -351,20 +347,10 @@ class DiscordBridge:
             self._client.user,
             self._client.user.id if self._client.user else "?",
         )
-        if not self._allowed_users_dm:
-            logger.warning(
-                "Discord bridge: allowed_users_dm is empty — the bot will respond "
-                "to DMs from anyone."
-            )
         if not self._allowed_servers:
             logger.warning(
                 "Discord bridge: allowed_servers is empty — the bot will not respond "
                 "in any server."
-            )
-        if not self._admin_users:
-            logger.warning(
-                "Discord bridge: admin_users is empty — nobody can use /%s in group sessions.",
-                self._reset_command.lstrip("/"),
             )
         await _cmd_module.sync_app_commands(self)
 
@@ -380,7 +366,7 @@ class DiscordBridge:
              from a specific message and that message is still cached.
           2. fetch the starter message via the API if not cached.
           3. Fall back to the channel's current tail if the starter message
-             can't be resolved (e.g. forum-style threads with no parent msg).
+             can't be resolved (e.g. threads created without a starter message).
         """
         thread_id  = str(thread.id)
         cursor_key = f"thread:{thread_id}"
@@ -403,7 +389,7 @@ class DiscordBridge:
                 parent = self._client.get_channel(thread.parent_id)
                 if parent is None:
                     parent = await self._client.fetch_channel(thread.parent_id)
-                # The thread's id == the starter message's id for message threads.
+                # For message threads, thread.id == starter message.id
                 fetched = await parent.fetch_message(thread.id)
                 starter_msg_id = str(fetched.id)
             except Exception:
