@@ -94,16 +94,18 @@ When the active turn approaches this limit, TinyCTX trims the oldest non-system 
 
 ## Memory
 
-TinyCTX has two complementary memory systems.
+TinyCTX has three complementary memory systems.
 
-### RAG (workspace/memory/*.md)
+### Core Files
 
-Any `.md` files placed under `workspace/memory/` are indexed and searched automatically each turn. The most relevant chunks are injected into context. Subdirectories are supported.
-
-**Static files** — always injected every turn:
+These files are always injected every turn:
 - `SOUL.md` — agent personality
 - `AGENTS.md` — roles, personas, or sub-agent definitions
-- `MEMORY.md` — facts that should always be available
+- `TOOLS.md` — tool usage guidelines
+
+### RAG (workspace/rag/folder/*.md)
+
+Any `.md` files placed under `workspace/rag` are indexed. They can be configured to be searched automatically each turn. The most relevant chunks are injected into context. Subdirectories are supported.
 
 To enable embedding-based (semantic) search, add an embedding model:
 
@@ -121,7 +123,7 @@ memory_search:
 
 Without an embedding model, BM25 keyword search is used — no extra server required.
 
-The agent can also call `memory_search` explicitly to look things up on demand. See `example.config.yaml` under `memory_search:` for all options (chunk strategy, budget, top-k, auto-inject, etc.).
+The agent can also call `rag_search` explicitly to look things up on demand. See `example.config.yaml` under `rag:` for all options (chunk strategy, budget, top-k, auto-inject, etc.).
 
 ### Knowledge Graph (memory module)
 
@@ -153,35 +155,7 @@ Each user has a **permission level** (0–100). Tools declare a `min_permission`
 /user rename <username> <new>
 ```
 
-### Bridge permission mapping
-
-**Discord** — maps role IDs to permission levels:
-
-```yaml
-bridges:
-  discord:
-    options:
-      dm_permission: 50           # level granted to anyone who DMs the bot
-      default_permission: 25      # fallback for users with no matching role
-      role_permissions:
-        123456789012345678: 100   # Admin role → level 100
-        234567890123456789: 50    # Moderator → level 50
-```
-
-**Matrix** — maps room power levels:
-
-```yaml
-bridges:
-  matrix:
-    options:
-      default_permission: 25
-      power_level_map:
-        100: 100
-        50:  50
-        0:   25
-```
-
-### Token visibility
+### Tool visibility
 
 By default (`permissions.minimal_tokens: true`), the LLM only sees tools the current caller has permission to execute — higher-privilege tools are hidden entirely, saving tokens and avoiding confusion. Set `minimal_tokens: false` to show all tools; execution-time guards still apply.
 
@@ -296,10 +270,6 @@ bridges:
       allowed_servers:
         987654321098765432: []   # all channels in this server
       admin_users: [123456789012345678]
-      dm_permission: 50
-      default_permission: 25
-      role_permissions:
-        111111111111111111: 100
       prefix_required: true
       command_prefix: "!"
 ```
