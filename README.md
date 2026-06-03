@@ -66,7 +66,7 @@ Layout:
 ├── HEARTBEAT.md      # Heartbeat instructions (read by agent each heartbeat turn)
 ├── memory/           # Semantic search corpus — any *.md files here are searchable
 │   ├── graph.lbug    # LadybugDB knowledge graph (memory module)
-│   └── session-YYYY-MM-DD.md
+│   └── librarian.log # Librarian logging
 ├── downloads/        # Files and images sent by users via bridges
 ├── CRON.json         # Scheduled jobs (cron module)
 └── skills/           # Skill folders
