@@ -17,10 +17,40 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
+_DEDUP_CACHE_PATH = Path(__file__).parent / "dedup_cache.json"
 
 
 def _prompt(filename: str) -> str:
     return (_PROMPTS_DIR / filename).read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Distinct-pair cache  (persists across cycles; keyed by frozenset of uuids)
+# ---------------------------------------------------------------------------
+
+def _load_distinct_cache() -> set[frozenset]:
+    """Load the set of UUID pairs already confirmed as distinct."""
+    try:
+        raw = json.loads(_DEDUP_CACHE_PATH.read_text(encoding="utf-8"))
+        return {frozenset(pair) for pair in raw}
+    except (FileNotFoundError, json.JSONDecodeError, TypeError):
+        return set()
+
+
+def _save_distinct_cache(cache: set[frozenset]) -> None:
+    _DEDUP_CACHE_PATH.write_text(
+        json.dumps([sorted(pair) for pair in cache], indent=2),
+        encoding="utf-8",
+    )
+
+
+def _invalidate_cache_for(cache: set[frozenset], uuid: str) -> None:
+    """Remove all pairs containing uuid from the cache (in-place)."""
+    to_remove = {pair for pair in cache if uuid in pair}
+    cache -= to_remove
+
+
+# ---------------------------------------------------------------------------
 
 
 async def get_relation_types(conn) -> str:
@@ -50,7 +80,7 @@ async def _aset(conn, uid: str, field: str, value):
 
 
 # ---------------------------------------------------------------------------
-# Conversation node → text
+# Conversation node -> text
 # ---------------------------------------------------------------------------
 
 def nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> tuple[str, str]:
@@ -187,6 +217,10 @@ async def run_dedup_cycle(
             logger.info("[memory/librarian] dedup: fewer than 2 entities, skipping")
             return
 
+        # Load the persisted distinct-pair cache.
+        distinct_cache = _load_distinct_cache()
+        cache_dirty = False
+
         embed_model_name = getattr(embedder, "model", "")
         stale = []
         for e in entities:
@@ -200,6 +234,11 @@ async def run_dedup_cycle(
 
         if stale:
             logger.info("[memory/librarian] dedup: refreshing %d stale embedding(s)", len(stale))
+            # Invalidate cache entries for any entity whose content has changed.
+            for e in stale:
+                _invalidate_cache_for(distinct_cache, e["e.uuid"])
+                cache_dirty = True
+
             texts   = [embed_content_for(e["e.name"], e["e.description"]) for e in stale]
             vectors = await embedder.embed(texts)
             async with write_lock:
@@ -235,6 +274,8 @@ async def run_dedup_cycle(
 
         if not candidates:
             logger.info("[memory/librarian] dedup: no candidate pairs above threshold %.2f", threshold)
+            if cache_dirty:
+                _save_distinct_cache(distinct_cache)
             return
 
         logger.info("[memory/librarian] dedup: %d candidate pair(s) to evaluate", len(candidates))
@@ -251,16 +292,23 @@ async def run_dedup_cycle(
 
         for ea, eb, _score in candidates:
             pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
-            if pair_key in already_aliased:
+            if pair_key in already_aliased or pair_key in distinct_cache:
                 continue
-            await _dedup_pair(conn, write_lock, llm, ea, eb, agent_logger)
+            verdict = await _dedup_pair(conn, write_lock, llm, ea, eb, agent_logger)
+            if verdict == "distinct":
+                distinct_cache.add(pair_key)
+                cache_dirty = True
+
+        if cache_dirty:
+            _save_distinct_cache(distinct_cache)
 
         logger.info("[memory/librarian] dedup cycle complete")
     except Exception:
         logger.exception("[memory/librarian] dedup cycle error")
 
 
-async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, agent_logger: logging.Logger) -> None:
+async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, agent_logger: logging.Logger) -> str:
+    """Evaluate one candidate pair. Returns the verdict string: 'distinct', 'duplicate', or 'alias'."""
     from TinyCTX.modules.memory.graph import now_ts
     from TinyCTX.ai import TextDelta
 
@@ -289,25 +337,25 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
             "[memory/librarian] dedup: could not parse verdict for %s/%s: %s",
             ea["e.uuid"][:8], eb["e.uuid"][:8], raw[:200],
         )
-        return
+        return "distinct"
 
     verdict        = verdict_data.get("verdict", "distinct")
     canonical_uuid = verdict_data.get("canonical_uuid")
     merged_desc    = verdict_data.get("merged_description", "")
 
     if verdict == "distinct":
-        return
+        return "distinct"
 
     if not canonical_uuid or canonical_uuid not in {ea["e.uuid"], eb["e.uuid"]}:
         logger.warning("[memory/librarian] dedup: invalid canonical_uuid in verdict")
-        return
+        return "distinct"
 
     dup_uuid = eb["e.uuid"] if canonical_uuid == ea["e.uuid"] else ea["e.uuid"]
     now      = now_ts()
 
     async with write_lock:
         if verdict == "duplicate":
-            logger.info("[memory/librarian] dedup: merging %s → %s", dup_uuid[:8], canonical_uuid[:8])
+            logger.info("[memory/librarian] dedup: merging %s -> %s", dup_uuid[:8], canonical_uuid[:8])
             await _aset(conn, canonical_uuid, "description", merged_desc)
             await _aset(conn, canonical_uuid, "updated_at",  now)
             await _aset(conn, canonical_uuid, "embed_hash",  "")
@@ -332,7 +380,7 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
                 parameters={"uid": dup_uuid},
             )
         elif verdict == "alias":
-            logger.info("[memory/librarian] dedup: aliasing %s → %s", dup_uuid[:8], canonical_uuid[:8])
+            logger.info("[memory/librarian] dedup: aliasing %s -> %s", dup_uuid[:8], canonical_uuid[:8])
             await _aset(conn, dup_uuid, "description", merged_desc)
             await _aset(conn, dup_uuid, "updated_at",  now)
             await conn.execute(
@@ -342,6 +390,8 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
                 f"description: 'alias', created_at: {now!r}, superseded_at: null}}]->(c)",
                 parameters={"alias": dup_uuid, "canon": canonical_uuid},
             )
+
+    return verdict
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +454,7 @@ async def _agent_loop(
                 caller_level=25,
             )
             result = outcome["result"] if outcome["success"] else outcome["error"]
-            agent_logger.debug("  tool %s → %s", tc["name"], result)
+            agent_logger.debug("  tool %s -> %s", tc["name"], result)
             messages.append({
                 "role":         "tool",
                 "tool_call_id": tc["id"],
