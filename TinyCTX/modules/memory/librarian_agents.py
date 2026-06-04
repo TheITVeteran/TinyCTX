@@ -1,4 +1,4 @@
-"""
+﻿"""
 modules/memory/librarian_agents.py
 
 Pure agent logic for the knowledge librarian: buffer ingestion, targeted
@@ -231,11 +231,12 @@ async def run_dedup_cycle(
     logger.info("[memory/librarian] dedup cycle starting")
     try:
         from TinyCTX.modules.memory.graph import (
-            graph_embed_content_for, embed_content_for, embed_hash, cosine_similarity,
+            embed_content_for, embed_hash, cosine_similarity,
         )
 
-        threshold   = float(cfg.get("similarity_threshold", 0.85))
-        dedup_batch = int(cfg.get("dedup_batch_count", 1))
+        threshold    = float(cfg.get("similarity_threshold", 0.85))
+        dedup_batch  = int(cfg.get("dedup_batch_count", 1))
+        doc_template = cfg.get("embed_document_template", "{text}")
 
         r = await conn.execute(
             "MATCH (e:Entity) RETURN e.uuid, e.name, e.description, e.entity_type, "
@@ -258,7 +259,7 @@ async def run_dedup_cycle(
         stale = []
         for e in entities:
             expected_hash = embed_hash(
-                graph_embed_content_for(e["e.name"], e["e.entity_type"], e["e.description"])
+                embed_content_for(e["e.name"], e["e.description"], doc_template=doc_template)
             )
             if (
                 not e["e.graph_embedding"]
@@ -275,7 +276,7 @@ async def run_dedup_cycle(
                 cache_dirty = True
 
             texts   = [
-                graph_embed_content_for(e["e.name"], e["e.entity_type"], e["e.description"])
+                embed_content_for(e["e.name"], e["e.description"], doc_template=doc_template)
                 for e in stale
             ]
             vectors = await embedder.embed(texts)

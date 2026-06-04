@@ -1,4 +1,4 @@
-EXTENSION_META = {
+﻿EXTENSION_META = {
     "name":    "memory",
     "version": "0.2",
     "description": (
@@ -27,6 +27,11 @@ EXTENSION_META = {
         # Embedding model key from config.yaml models: (must be kind: embedding)
         # Leave empty to disable semantic search (keyword only)
         "embedding_model": "",
+
+        # Templates applied to text before embedding. Use {text} as the placeholder.
+        # e.g. "Query: {text}" / "Document: {text}" for models like Jina.
+        "embed_query_template":    "{text}",
+        "embed_document_template": "{text}",
 
         # Separate embedding model for dedup/graph similarity.
         # When set, graph_embedding is stored alongside the regular embedding.

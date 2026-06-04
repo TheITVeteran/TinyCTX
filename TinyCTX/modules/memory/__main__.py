@@ -1,4 +1,4 @@
-"""
+﻿"""
 modules/memory/__main__.py
 
 Registers the memory module.
@@ -434,6 +434,23 @@ def register_runtime(runtime) -> None:
                 embedding_model, exc,
             )
 
+    # Graph embedder (dedup) — falls back to search embedder when not configured
+    graph_embedder        = None
+    graph_embedding_model = cfg.get("graph_embedding_model", "").strip()
+    if graph_embedding_model and graph_embedding_model != embedding_model:
+        try:
+            from TinyCTX.ai import Embedder
+            gemb_cfg       = runtime.config.get_embedding_model(graph_embedding_model)
+            graph_embedder = Embedder.from_config(gemb_cfg)
+            logger.info("[memory] graph embedder: %s @ %s", gemb_cfg.model, gemb_cfg.base_url)
+        except (KeyError, ValueError) as exc:
+            logger.warning(
+                "[memory] graph_embedding_model '%s' not usable (%s)"
+                " â falling back to search embedder for dedup",
+                graph_embedding_model, exc,
+            )
+    # None here means LibrarianRunner falls back to the search embedder
+
     # LLM for librarian agents
     primary_name        = runtime.config.llm.primary
     librarian_model_key = cfg.get("librarian_model", "").strip() or primary_name
@@ -466,7 +483,11 @@ def register_runtime(runtime) -> None:
     # tools
     import TinyCTX.modules.memory.tools as tools_mod
     _tools = tools_mod
-    _tools.init(_runner._write_conn, _runner._write_lock, _graph_db, embedder)
+    _tools.init(
+        _runner._write_conn, _runner._write_lock, _graph_db, embedder,
+        query_template=cfg.get("embed_query_template", "{text}"),
+        doc_template=cfg.get("embed_document_template", "{text}"),
+    )
 
     # Shutdown: stop writer → close read conn → checkpoint + close DB.
     # Registered on atexit and both termination signals so clean exits always

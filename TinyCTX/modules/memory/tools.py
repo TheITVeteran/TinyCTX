@@ -1,4 +1,4 @@
-"""
+﻿"""
 modules/memory/tools.py
 
 Memory tool functions for the knowledge graph.
@@ -14,18 +14,30 @@ from TinyCTX.modules.memory.graph import new_uuid, now_ts, top_k_cosine
 
 logger = logging.getLogger(__name__)
 
-_conn:       Any = None
-_write_lock: Any = None
-_graph_db:   Any = None
-_embedder:   Any = None
+_conn:           Any = None
+_write_lock:     Any = None
+_graph_db:       Any = None
+_embedder:       Any = None
+_query_template: str = "{text}"
+_doc_template:   str = "{text}"
 
 
-def init(conn, write_lock: asyncio.Lock, graph_db, embedder):
-    global _conn, _write_lock, _graph_db, _embedder
-    _conn       = conn
-    _write_lock = write_lock
-    _graph_db   = graph_db
-    _embedder   = embedder
+def init(
+    conn,
+    write_lock: asyncio.Lock,
+    graph_db,
+    embedder,
+    *,
+    query_template: str = "{text}",
+    doc_template: str = "{text}",
+):
+    global _conn, _write_lock, _graph_db, _embedder, _query_template, _doc_template
+    _conn             = conn
+    _write_lock       = write_lock
+    _graph_db         = graph_db
+    _embedder         = embedder
+    _query_template   = query_template
+    _doc_template     = doc_template
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +261,7 @@ async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
     query_vec = None
     if semantic and _embedder is not None:
         try:
-            query_vec = await _embedder.embed_one(query)
+            query_vec = await _embedder.embed_one(_query_template.format(text=query))
         except Exception as exc:
             logger.warning("[memory] kg_search embed failed: %s -- falling back to keyword", exc)
 

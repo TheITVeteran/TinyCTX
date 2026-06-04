@@ -1,4 +1,4 @@
-"""
+﻿"""
 modules/memory/graph.py
 
 LadybugDB schema initialisation, database lifetime management, and low-level
@@ -205,18 +205,15 @@ def embed_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def embed_content_for(name: str, description: str) -> str:
-    """The string we embed — name + space + description."""
-    return f"{name} {description}"
-
-
-def graph_embed_content_for(name: str, entity_type: str, description: str) -> str:
-    """
-    The string we embed for graph/dedup purposes.
-    Includes entity_type so the model can distinguish e.g. two entities named
-    'Alice' of different types.
-    """
-    return f"{entity_type}: {name} {description}"
+def embed_content_for(
+    name: str,
+    description: str,
+    *,
+    doc_template: str = "{text}",
+) -> str:
+    """Format name+description via doc_template (use {text} as placeholder)."""
+    body = f"{name} {description}"
+    return doc_template.format(text=body)
 
 
 # ---------------------------------------------------------------------------
