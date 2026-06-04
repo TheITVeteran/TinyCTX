@@ -50,6 +50,12 @@ def _invalidate_cache_for(cache: set[frozenset], uuid: str) -> None:
     cache -= to_remove
 
 
+def _chunks(lst: list, n: int):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -202,7 +208,8 @@ async def run_dedup_cycle(
             embed_content_for, embed_hash, cosine_similarity,
         )
 
-        threshold = float(cfg.get("similarity_threshold", 0.85))
+        threshold   = float(cfg.get("similarity_threshold", 0.85))
+        dedup_batch = int(cfg.get("dedup_batch_count", 1))
 
         r = await conn.execute(
             "MATCH (e:Entity) RETURN e.uuid, e.name, e.description, e.entity_type, "
@@ -290,14 +297,40 @@ async def run_dedup_cycle(
             row = r.get_next()
             already_aliased.add(frozenset([row[0], row[1]]))
 
-        for ea, eb, _score in candidates:
-            pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
-            if pair_key in already_aliased or pair_key in distinct_cache:
-                continue
-            verdict = await _dedup_pair(conn, write_lock, llm, ea, eb, agent_logger)
-            if verdict == "distinct":
-                distinct_cache.add(pair_key)
-                cache_dirty = True
+        # Filter candidates down to those still needing evaluation.
+        pending = [
+            (ea, eb, score) for ea, eb, score in candidates
+            if frozenset([ea["e.uuid"], eb["e.uuid"]]) not in already_aliased
+            and frozenset([ea["e.uuid"], eb["e.uuid"]]) not in distinct_cache
+        ]
+
+        for chunk in _chunks(pending, dedup_batch):
+            if dedup_batch == 1:
+                ea, eb, _ = chunk[0]
+                verdict = await _dedup_pair(conn, write_lock, llm, ea, eb, agent_logger)
+                if verdict == "distinct":
+                    distinct_cache.add(frozenset([ea["e.uuid"], eb["e.uuid"]]))
+                    cache_dirty = True
+            else:
+                pairs = [(ea, eb) for ea, eb, _ in chunk]
+                try:
+                    results = await _dedup_batch(conn, write_lock, llm, pairs, agent_logger)
+                except Exception:
+                    logger.warning(
+                        "[memory/librarian] dedup: batch of %d failed, retrying individually", len(pairs)
+                    )
+                    results = []
+                    for ea, eb in pairs:
+                        verdict = await _dedup_pair(
+                            conn, write_lock, llm, ea, eb, agent_logger, cache_on_fail=False
+                        )
+                        results.append((frozenset([ea["e.uuid"], eb["e.uuid"]]), verdict, True))
+
+                for entry in results:
+                    pair_key, verdict, cacheable = entry
+                    if verdict == "distinct" and cacheable:
+                        distinct_cache.add(pair_key)
+                        cache_dirty = True
 
         if cache_dirty:
             _save_distinct_cache(distinct_cache)
@@ -307,8 +340,25 @@ async def run_dedup_cycle(
         logger.exception("[memory/librarian] dedup cycle error")
 
 
-async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, agent_logger: logging.Logger) -> str:
-    """Evaluate one candidate pair. Returns the verdict string: 'distinct', 'duplicate', or 'alias'."""
+# ---------------------------------------------------------------------------
+# Dedup: single pair
+# ---------------------------------------------------------------------------
+
+async def _dedup_pair(
+    conn,
+    write_lock: asyncio.Lock,
+    llm,
+    ea: dict,
+    eb: dict,
+    agent_logger: logging.Logger,
+    cache_on_fail: bool = True,
+) -> str:
+    """
+    Evaluate one candidate pair.
+    Returns the verdict string: 'distinct', 'duplicate', or 'alias'.
+    On parse failure, returns 'distinct'. cache_on_fail controls whether the
+    caller should cache that fallback verdict (False = don't cache, retry next cycle).
+    """
     from TinyCTX.modules.memory.graph import now_ts
     from TinyCTX.ai import TextDelta
 
@@ -350,6 +400,108 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
         logger.warning("[memory/librarian] dedup: invalid canonical_uuid in verdict")
         return "distinct"
 
+    await _apply_verdict(conn, write_lock, ea, eb, verdict, canonical_uuid, merged_desc)
+    return verdict
+
+
+# ---------------------------------------------------------------------------
+# Dedup: batch of pairs
+# ---------------------------------------------------------------------------
+
+async def _dedup_batch(
+    conn,
+    write_lock: asyncio.Lock,
+    llm,
+    pairs: list[tuple[dict, dict]],
+    agent_logger: logging.Logger,
+) -> list[tuple[frozenset, str, bool]]:
+    """
+    Evaluate a batch of candidate pairs in a single LLM call.
+    Returns a list of (pair_key, verdict_str, cacheable) tuples.
+    Raises on parse failure or wrong number of verdicts so the caller can retry individually.
+    """
+    from TinyCTX.ai import TextDelta
+
+    pair_lines = []
+    for idx, (ea, eb) in enumerate(pairs):
+        pair_lines.append(
+            f"[{idx}]\n"
+            f"  Node A: uuid={ea['e.uuid']}  name={ea['e.name']}  "
+            f"type={ea['e.entity_type']}  description={ea['e.description']}\n"
+            f"  Node B: uuid={eb['e.uuid']}  name={eb['e.name']}  "
+            f"type={eb['e.entity_type']}  description={eb['e.description']}"
+        )
+
+    prompt = _prompt("dedup_batch_user.txt").format(
+        pairs_block="\n\n".join(pair_lines),
+        pair_count=len(pairs),
+    )
+
+    response_text = ""
+    async for event in llm.stream([{"role": "user", "content": prompt}], tools=None):
+        if isinstance(event, TextDelta):
+            response_text += event.text
+
+    if response_text:
+        agent_logger.info("[dedup batch/%d] %s", len(pairs), response_text)
+
+    raw = _re.sub(r"^```json?\s*", "", response_text.strip())
+    raw = _re.sub(r"\s*```$", "", raw)
+
+    verdicts_data = json.loads(raw)  # raises JSONDecodeError on failure → caller retries
+
+    if not isinstance(verdicts_data, list) or len(verdicts_data) != len(pairs):
+        raise ValueError(
+            f"Expected {len(pairs)} verdicts, got "
+            f"{len(verdicts_data) if isinstance(verdicts_data, list) else type(verdicts_data).__name__}"
+        )
+
+    results: list[tuple[frozenset, str, bool]] = []
+    for item in verdicts_data:
+        idx            = item.get("pair_index")
+        verdict        = item.get("verdict", "distinct")
+        canonical_uuid = item.get("canonical_uuid")
+        merged_desc    = item.get("merged_description", "")
+
+        if not isinstance(idx, int) or idx < 0 or idx >= len(pairs):
+            raise ValueError(f"Invalid pair_index {idx!r} in batch verdict")
+
+        ea, eb = pairs[idx]
+        pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
+
+        if verdict == "distinct":
+            results.append((pair_key, "distinct", True))
+            continue
+
+        if not canonical_uuid or canonical_uuid not in {ea["e.uuid"], eb["e.uuid"]}:
+            logger.warning(
+                "[memory/librarian] dedup batch: invalid canonical_uuid for pair %d, skipping", idx
+            )
+            results.append((pair_key, "distinct", False))
+            continue
+
+        await _apply_verdict(conn, write_lock, ea, eb, verdict, canonical_uuid, merged_desc)
+        results.append((pair_key, verdict, True))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Shared verdict application
+# ---------------------------------------------------------------------------
+
+async def _apply_verdict(
+    conn,
+    write_lock: asyncio.Lock,
+    ea: dict,
+    eb: dict,
+    verdict: str,
+    canonical_uuid: str,
+    merged_desc: str,
+) -> None:
+    """Apply a non-distinct dedup verdict (duplicate or alias) to the graph."""
+    from TinyCTX.modules.memory.graph import now_ts
+
     dup_uuid = eb["e.uuid"] if canonical_uuid == ea["e.uuid"] else ea["e.uuid"]
     now      = now_ts()
 
@@ -390,8 +542,6 @@ async def _dedup_pair(conn, write_lock: asyncio.Lock, llm, ea: dict, eb: dict, a
                 f"description: 'alias', created_at: {now!r}, superseded_at: null}}]->(c)",
                 parameters={"alias": dup_uuid, "canon": canonical_uuid},
             )
-
-    return verdict
 
 
 # ---------------------------------------------------------------------------

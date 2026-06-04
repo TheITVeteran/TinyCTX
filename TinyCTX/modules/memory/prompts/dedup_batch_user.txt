@@ -1,0 +1,20 @@
+You are comparing knowledge graph node pairs to decide if each pair represents the same real-world thing.
+
+{pairs_block}
+
+Respond with ONLY a JSON array, one object per pair, in index order:
+[
+  {{
+    "pair_index": 0,
+    "verdict": "duplicate" | "alias" | "distinct",
+    "canonical_uuid": "<uuid of node to keep — required unless distinct>",
+    "merged_description": "<consolidated description — required unless distinct>"
+  }},
+  ...
+]
+
+duplicate = same real-world entity (merge into one node).
+alias = different names for the same underlying thing (keep both, add ALIASED_TO edge).
+distinct = genuinely different entities.
+
+You MUST return exactly {pair_count} objects, one per pair index.
