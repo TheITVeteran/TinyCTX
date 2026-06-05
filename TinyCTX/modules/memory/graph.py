@@ -216,6 +216,38 @@ def embed_content_for(
     return doc_template.format(text=body)
 
 
+def embed_content_with_edges(
+    name: str,
+    description: str,
+    edges_out: list[dict],
+    *,
+    doc_template: str = "{text}",
+) -> str:
+    """
+    Build the embedding string for a graph node, including its 1-hop outgoing
+    neighbourhood so that structurally different nodes with similar text
+    descriptions are pushed apart in embedding space.
+
+    Each active outgoing edge contributes a short natural-language phrase:
+        RELATION_TYPE -> target_name
+    becomes
+        "relation type -> target name"
+
+    The resulting string is passed through doc_template before being sent to
+    the embedding model, exactly like the plain embed_content_for path.
+    """
+    body = f"{name} {description}"
+    if edges_out:
+        edge_phrases = [
+            f"{e['relation'].replace('_', ' ').lower()} -> {e['target_name']}"
+            for e in edges_out
+            if e.get("relation") and e.get("target_name")
+        ]
+        if edge_phrases:
+            body = body + "\nEdges: " + "; ".join(edge_phrases)
+    return doc_template.format(text=body)
+
+
 # ---------------------------------------------------------------------------
 # Cosine similarity
 # ---------------------------------------------------------------------------

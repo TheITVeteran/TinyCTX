@@ -81,6 +81,28 @@ async def kg_add_entity(
     )
     if r.has_next():
         uid = r.get_next()[0]
+        # Return the entity's current state so the agent can decide whether to
+        # call kg_update_entity without a redundant kg_get_entity round-trip.
+        existing = _graph_db.get_entity(uid)
+        if existing:
+            ex_desc = existing.get("e.description", "")
+            ex_pri  = existing.get("e.priority", "?")
+            ex_pin  = existing.get("e.pinned", False)
+            lines   = [
+                f"Error: {entity_type} '{name}' already exists (UUID: {uid}).",
+                f"  Description: {ex_desc}",
+                f"  Priority: {ex_pri}  |  Pinned: {ex_pin}",
+            ]
+            for edge in existing.get("edges_out", []):
+                w    = edge.get("weight", "")
+                note = f" — {edge['description']}" if edge.get("description") else ""
+                lines.append(f"  ->[{edge['relation']}]-> {edge['target_name']} (UUID: {edge['target_uuid']}) (w={w}){note}")
+            for edge in existing.get("edges_in", []):
+                w    = edge.get("weight", "")
+                note = f" — {edge['description']}" if edge.get("description") else ""
+                lines.append(f"  <-[{edge['relation']}]<- {edge['source_name']} (UUID: {edge['source_uuid']}) (w={w}){note}")
+            lines.append("Use kg_update_entity to modify it.")
+            return "\n".join(lines)
         return (
             f"Error: {entity_type} '{name}' already exists (UUID: {uid}). "
             f"Use kg_update_entity to modify it."

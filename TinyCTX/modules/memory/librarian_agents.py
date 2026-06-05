@@ -227,11 +227,23 @@ async def run_dedup_cycle(
     Refreshes graph_embedding / graph_embed_* columns.  Cosine similarity for
     candidate selection uses graph_embedding, falling back to the regular
     search embedding when graph_embedding is NULL on an entity.
+
+    Thrash mitigations
+    ------------------
+    1. Neighbourhood-aware embeddings: each node's graph_embedding is built
+       from name + description + its 1-hop outgoing edges, so nodes that share
+       text but differ structurally are pushed apart in embedding space.
+
+    2. Stale-only comparison: cosine similarity is computed only for pairs
+       where AT LEAST ONE side was re-embedded this cycle.  Non-stale vs
+       non-stale pairs were already evaluated in a previous cycle and are
+       either in distinct_cache, already_aliased, or pending from before --
+       re-checking them is pure waste.  This reduces O(N^2) to O(stale x N).
     """
     logger.info("[memory/librarian] dedup cycle starting")
     try:
         from TinyCTX.modules.memory.graph import (
-            embed_content_for, embed_hash, cosine_similarity,
+            embed_content_with_edges, embed_hash, cosine_similarity,
         )
 
         threshold    = float(cfg.get("similarity_threshold", 0.85))
@@ -255,11 +267,35 @@ async def run_dedup_cycle(
         distinct_cache = _load_distinct_cache(workspace_path)
         cache_dirty = False
 
+        # ------------------------------------------------------------------
+        # Fetch 1-hop outgoing edges for every entity (one query, not N).
+        # Used to build neighbourhood-aware graph embeddings.
+        # ------------------------------------------------------------------
+        edges_by_uuid: dict[str, list[dict]] = {e["e.uuid"]: [] for e in entities}
+        er = await conn.execute(
+            "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
+            "WHERE r.superseded_at IS NULL "
+            "RETURN a.uuid, r.relation, b.name"
+        )
+        while er.has_next():
+            row = er.get_next()
+            src_uid, relation, target_name = row[0], row[1], row[2]
+            if src_uid in edges_by_uuid:
+                edges_by_uuid[src_uid].append({"relation": relation, "target_name": target_name})
+
         graph_embed_model_name = getattr(embedder, "model", "")
-        stale = []
+
+        # Identify stale entities: missing embedding, wrong model, or content changed.
+        # Content is now name + description + neighbourhood, so a new edge on an
+        # existing node makes that node stale and triggers re-embedding.
+        stale: list[dict] = []
         for e in entities:
+            uid   = e["e.uuid"]
+            edges = edges_by_uuid.get(uid, [])
             expected_hash = embed_hash(
-                embed_content_for(e["e.name"], e["e.description"], doc_template=doc_template)
+                embed_content_with_edges(
+                    e["e.name"], e["e.description"], edges, doc_template=doc_template
+                )
             )
             if (
                 not e["e.graph_embedding"]
@@ -268,15 +304,22 @@ async def run_dedup_cycle(
             ):
                 stale.append(e)
 
+        stale_uuids: set[str] = {e["e.uuid"] for e in stale}
+
         if stale:
             logger.info("[memory/librarian] dedup: refreshing %d stale graph embedding(s)", len(stale))
-            # Invalidate cache entries for any entity whose content has changed.
+            # Invalidate distinct-cache entries for any entity whose content changed.
             for e in stale:
                 _invalidate_cache_for(distinct_cache, e["e.uuid"])
                 cache_dirty = True
 
-            texts   = [
-                embed_content_for(e["e.name"], e["e.description"], doc_template=doc_template)
+            texts: list[str] = [
+                embed_content_with_edges(
+                    e["e.name"],
+                    e["e.description"],
+                    edges_by_uuid.get(e["e.uuid"], []),
+                    doc_template=doc_template,
+                )
                 for e in stale
             ]
             vectors = await embedder.embed(texts)
@@ -291,26 +334,41 @@ async def run_dedup_cycle(
                     e["e.graph_embedding"]     = vec
                     e["e.graph_embed_model"]   = graph_embed_model_name
                     e["e.graph_embed_hash"]    = h
+        else:
+            logger.info("[memory/librarian] dedup: all embeddings current, no pairs to re-evaluate")
+            return
 
+        # ------------------------------------------------------------------
+        # Candidate pair selection -- stale-only comparison.
+        #
+        # We only compute similarity for (ea, eb) pairs where at least one
+        # side is in stale_uuids.  Pairs where both sides are fresh were
+        # already evaluated in a prior cycle and their verdicts are recorded
+        # in distinct_cache or already_aliased.  Re-checking them would be
+        # O(N^2) thrashing with zero new information.
+        # ------------------------------------------------------------------
         pairs_seen: set[frozenset] = set()
         candidates: list[tuple[dict, dict, float]] = []
 
-        for i, ea in enumerate(entities):
-            # Prefer graph_embedding; fall back to regular search embedding.
-            emb_a = ea.get("e.graph_embedding") or ea.get("e.embedding") or []
+        for stale_e in stale:
+            emb_a = stale_e.get("e.graph_embedding") or stale_e.get("e.embedding") or []
             if not emb_a:
                 continue
-            for eb in entities[i + 1:]:
-                emb_b = eb.get("e.graph_embedding") or eb.get("e.embedding") or []
-                if not emb_b:
+            uid_a = stale_e["e.uuid"]
+            for eb in entities:
+                uid_b = eb["e.uuid"]
+                if uid_a == uid_b:
                     continue
-                pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
+                pair_key = frozenset([uid_a, uid_b])
                 if pair_key in pairs_seen:
                     continue
                 pairs_seen.add(pair_key)
+                emb_b = eb.get("e.graph_embedding") or eb.get("e.embedding") or []
+                if not emb_b:
+                    continue
                 score = cosine_similarity(emb_a, emb_b)
                 if score >= threshold:
-                    candidates.append((ea, eb, score))
+                    candidates.append((stale_e, eb, score))
 
         if not candidates:
             logger.info("[memory/librarian] dedup: no candidate pairs above threshold %.2f", threshold)
