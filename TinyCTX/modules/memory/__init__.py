@@ -42,6 +42,11 @@
         # Pinned entity injection priority in system prompt
         "pinned_priority": 5,
 
+        # How many user messages to scan back to find active participants.
+        # A pinned_target=<username> entity is only injected when that user
+        # appears within this many recent user turns.
+        "pinned_user_scan": 3,
+
         # Token budget for the <memory> block injected into system prompt
         "memory_block_tokens": 4096,
 

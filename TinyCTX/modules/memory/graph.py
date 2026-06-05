@@ -83,7 +83,7 @@ _SCHEMA_DDL = [
         name                STRING,
         entity_type         STRING,
         description         STRING,
-        pinned              BOOL,
+        pinned_target       STRING,
         priority            INT64,
         mention_count       INT64,
         created_at          DOUBLE,
@@ -148,9 +148,10 @@ def init_schema(conn) -> None:
 
 def migrate_schema(conn) -> None:
     """
-    Add graph_embedding columns to an existing Entity table that predates them.
+    Add graph_embedding and pinned_target columns to an existing Entity table.
     Safe to call on every startup; skips columns that already exist.
     """
+    # --- migration: graph_embedding columns ---
     already = False
     try:
         r = conn.execute(
@@ -160,33 +161,69 @@ def migrate_schema(conn) -> None:
     except Exception:
         pass
 
-    if already:
-        return
+    if not already:
+        cols_to_add = [
+            ("graph_embed_model",   "STRING"),
+            ("graph_embed_content", "STRING"),
+            ("graph_embed_hash",    "STRING"),
+            ("graph_embedding",     "DOUBLE[]"),
+        ]
+        for col, dtype in cols_to_add:
+            try:
+                conn.execute(f"ALTER TABLE Entity ADD {col} {dtype}")
+                logger.info("[memory/graph] migration: added column %s %s", col, dtype)
+            except Exception as exc:
+                if "already exist" in str(exc).lower() or "duplicate" in str(exc).lower():
+                    logger.debug("[memory/graph] migration: column %s already present", col)
+                else:
+                    logger.warning("[memory/graph] migration: unexpected error adding %s: %s", col, exc)
 
-    cols_to_add = [
-        ("graph_embed_model",   "STRING"),
-        ("graph_embed_content", "STRING"),
-        ("graph_embed_hash",    "STRING"),
-        ("graph_embedding",     "DOUBLE[]"),
-    ]
-    for col, dtype in cols_to_add:
         try:
-            conn.execute(f"ALTER TABLE Entity ADD {col} {dtype}")
-            logger.info("[memory/graph] migration: added column %s %s", col, dtype)
-        except Exception as exc:
-            if "already exist" in str(exc).lower() or "duplicate" in str(exc).lower():
-                logger.debug("[memory/graph] migration: column %s already present", col)
-            else:
-                logger.warning("[memory/graph] migration: unexpected error adding %s: %s", col, exc)
+            conn.execute(
+                "CREATE (m:GraphMeta {key: \'migration_graph_embedding_v1\', val: \'done\'})"
+            )
+        except Exception:
+            pass
 
+        logger.info("[memory/graph] migration: graph_embedding columns ready")
+
+    # --- migration: pinned_target column ---
+    already_pt = False
     try:
-        conn.execute(
-            "CREATE (m:GraphMeta {key: \'migration_graph_embedding_v1\', val: \'done\'})"
+        r = conn.execute(
+            "MATCH (m:GraphMeta {key: \'migration_pinned_target_v1\'}) RETURN m.val LIMIT 1"
         )
+        already_pt = r.has_next()
     except Exception:
         pass
 
-    logger.info("[memory/graph] migration: graph_embedding columns ready")
+    if not already_pt:
+        try:
+            conn.execute("ALTER TABLE Entity ADD pinned_target STRING")
+            logger.info("[memory/graph] migration: added column pinned_target STRING")
+        except Exception as exc:
+            if "already exist" in str(exc).lower() or "duplicate" in str(exc).lower():
+                logger.debug("[memory/graph] migration: column pinned_target already present")
+            else:
+                logger.warning("[memory/graph] migration: unexpected error adding pinned_target: %s", exc)
+
+        # Backfill: existing pinned=true entities become pinned_target='global'
+        try:
+            conn.execute(
+                "MATCH (e:Entity) WHERE e.pinned = true SET e.pinned_target = 'global'"
+            )
+            logger.info("[memory/graph] migration: backfilled pinned_target for existing pinned entities")
+        except Exception as exc:
+            logger.warning("[memory/graph] migration: backfill failed (old pinned col may not exist): %s", exc)
+
+        try:
+            conn.execute(
+                "CREATE (m:GraphMeta {key: \'migration_pinned_target_v1\', val: \'done\'})"
+            )
+        except Exception:
+            pass
+
+        logger.info("[memory/graph] migration: pinned_target ready")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -576,19 +613,13 @@ class GraphDB:
             clauses.append("e.entity_type = $et")
             params["et"] = entity_type
         if pinned_only:
-            clauses.append("e.pinned = true")
+            clauses.append("e.pinned_target IS NOT NULL")
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         r = self.safe_execute(
-            f"MATCH (e:Entity) {where} RETURN e.uuid, e.name, e.entity_type, e.description, e.pinned, e.priority ORDER BY e.priority DESC",
+            f"MATCH (e:Entity) {where} RETURN e.uuid, e.name, e.entity_type, e.description, e.pinned_target, e.priority ORDER BY e.priority DESC",
             parameters=params if params else None,
         )
-        return self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description", "pinned", "priority"])
-
-    def get_pinned_entities(self) -> list[dict]:
-        r = self.safe_execute(
-            "MATCH (e:Entity) WHERE e.pinned = true RETURN e.uuid, e.name, e.entity_type, e.description ORDER BY e.priority DESC"
-        )
-        return self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description"])
+        return self._rows_to_dicts(r, ["uuid", "name", "entity_type", "description", "pinned_target", "priority"])
 
     def get_pinned_entities_full(self) -> list[dict]:
         """
@@ -596,7 +627,7 @@ class GraphDB:
         ordered by priority descending. Used by the memory block assembler.
         """
         r = self.safe_execute(
-            "MATCH (e:Entity) WHERE e.pinned = true RETURN e.uuid ORDER BY e.priority DESC"
+            "MATCH (e:Entity) WHERE e.pinned_target IS NOT NULL RETURN e.uuid ORDER BY e.priority DESC"
         )
         uuids = [row[0] for row in self._drain(r)]
         results = []
@@ -660,7 +691,7 @@ class GraphDB:
         ).get_next()[0]
 
         pinned_count = self.safe_execute(
-            "MATCH (e:Entity) WHERE e.pinned = true RETURN count(e)"
+            "MATCH (e:Entity) WHERE e.pinned_target IS NOT NULL RETURN count(e)"
         ).get_next()[0]
 
         avg_priority_row = self.safe_execute(

@@ -61,6 +61,8 @@ async def kg_add_entity(
     description: str,
     priority: int = 40,
     pinned: bool = False,
+    pinned_type: str = "global",
+    pinned_user: str = "",
 ) -> str:
     """
     Add a new knowledge graph entity. Returns an error if an entity with the
@@ -72,7 +74,11 @@ async def kg_add_entity(
             Location, Organization, Project, Technology, Rule, Directive, Role.
         description: 1-3 sentence factual description.
         priority: 0-100 importance score (default 40).
-        pinned: If true, inject into every system prompt.
+        pinned: If true, inject into system prompt based on pinned_type.
+        pinned_type: "global" (always inject) or "user" (inject only when
+            pinned_user is active in the conversation). Only used when pinned=True.
+        pinned_user: TinyCTX username for user-scoped pinning. Only used when
+            pinned=True and pinned_type="user".
     """
     now = now_ts()
     r = await _conn.execute(
@@ -85,13 +91,14 @@ async def kg_add_entity(
         # call kg_update_entity without a redundant kg_get_entity round-trip.
         existing = _graph_db.get_entity(uid)
         if existing:
-            ex_desc = existing.get("e.description", "")
-            ex_pri  = existing.get("e.priority", "?")
-            ex_pin  = existing.get("e.pinned", False)
-            lines   = [
-                f"Error: {entity_type} '{name}' already exists (UUID: {uid}).",
+            ex_desc   = existing.get("e.description", "")
+            ex_pri    = existing.get("e.priority", "?")
+            ex_pin    = existing.get("e.pinned_target")
+            pin_note  = f"  [pinned:{ex_pin}]" if ex_pin else ""
+            lines     = [
+                f"Error: {entity_type} '{name}' already exists (UUID: {uid}).{pin_note}",
                 f"  Description: {ex_desc}",
-                f"  Priority: {ex_pri}  |  Pinned: {ex_pin}",
+                f"  Priority: {ex_pri}",
             ]
             for edge in existing.get("edges_out", []):
                 w    = edge.get("weight", "")
@@ -109,12 +116,15 @@ async def kg_add_entity(
         )
 
     uid = new_uuid()
+    pinned_target = None
+    if pinned:
+        pinned_target = pinned_user.strip() if pinned_type == "user" and pinned_user.strip() else "global"
     async with _write_lock:
         await _conn.execute("CREATE (e:Entity {uuid: $uid})", parameters={"uid": uid})
         await _aset(uid, "name",          name)
         await _aset(uid, "entity_type",   entity_type)
         await _aset(uid, "description",   description)
-        await _aset(uid, "pinned",        pinned)
+        await _aset(uid, "pinned_target", pinned_target)
         await _aset(uid, "priority",      priority)
         await _aset(uid, "mention_count", 0)
         await _aset(uid, "created_at",    now)
@@ -122,7 +132,7 @@ async def kg_add_entity(
         await _aset(uid, "embed_model",   "")
         await _aset(uid, "embed_content", "")
         await _aset(uid, "embed_hash",    "")
-    pin_note = "  [pinned]" if pinned else ""
+    pin_note = f"  [pinned:{pinned_target}]" if pinned_target else ""
     return (
         f"Added {entity_type} '{name}' (UUID: {uid}){pin_note}\n"
         f"  Description: {description}\n"
@@ -135,6 +145,8 @@ async def kg_update_entity(
     description: str | None = None,
     priority: int | None = None,
     pinned: bool | None = None,
+    pinned_type: str = "global",
+    pinned_user: str = "",
 ) -> str:
     """
     Update fields on an existing entity. Only provided fields are changed.
@@ -143,7 +155,10 @@ async def kg_update_entity(
         uuid: The entity UUID.
         description: New description (optional).
         priority: New priority value (optional).
-        pinned: New pinned flag (optional).
+        pinned: New pinned state (optional). False clears pinning entirely.
+        pinned_type: "global" or "user". Only used when pinned=True.
+        pinned_user: TinyCTX username for user-scoped pinning. Only used when
+            pinned=True and pinned_type="user".
     """
     if description is None and priority is None and pinned is None:
         return f"No fields to update — nothing changed for UUID {uuid}."
@@ -156,7 +171,7 @@ async def kg_update_entity(
     etype    = entity.get("e.entity_type", "Entity")
     old_desc = entity.get("e.description", "") or ""
     old_pri  = entity.get("e.priority")
-    old_pin  = entity.get("e.pinned")
+    old_pin  = entity.get("e.pinned_target")
 
     now = now_ts()
     async with _write_lock:
@@ -166,7 +181,13 @@ async def kg_update_entity(
         if priority is not None:
             await _aset(uuid, "priority", priority)
         if pinned is not None:
-            await _aset(uuid, "pinned", pinned)
+            if not pinned:
+                new_pin = None
+            elif pinned_type == "user" and pinned_user.strip():
+                new_pin = pinned_user.strip()
+            else:
+                new_pin = "global"
+            await _aset(uuid, "pinned_target", new_pin)
         await _aset(uuid, "updated_at", now)
 
     lines = [f"Updated {etype} '{name}' (UUID: {uuid})"]
@@ -179,7 +200,9 @@ async def kg_update_entity(
     if priority is not None:
         lines.append(f"  Priority: {old_pri} → {priority}")
     if pinned is not None:
-        lines.append(f"  Pinned: {old_pin} → {pinned}")
+        new_pin_display = new_pin or "(not pinned)"
+        old_pin_display = old_pin or "(not pinned)"
+        lines.append(f"  Pinned: {old_pin_display} → {new_pin_display}")
     return "\n".join(lines)
 
 
@@ -307,8 +330,9 @@ async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
         etype = entity.get("e.entity_type", "?")
         desc  = entity.get("e.description", "")
         pri   = entity.get("e.priority", "?")
-        pin   = "  [pinned]" if entity.get("e.pinned") else ""
-        lines.append(f"[{etype}] {name} (UUID: {uid}){pin}  priority: {pri}")
+        pin   = entity.get("e.pinned_target")
+        pin_note = f"  [pinned:{pin}]" if pin else ""
+        lines.append(f"[{etype}] {name} (UUID: {uid}){pin_note}  priority: {pri}")
         if desc:
             lines.append(f"  {desc}")
         for edge in entity.get("edges_out", []):
@@ -367,14 +391,13 @@ async def kg_get_entity(uuid: str) -> str:
     name  = entity.get("e.name", "?")
     etype = entity.get("e.entity_type", "?")
     desc  = entity.get("e.description", "")
-    pin   = entity.get("e.pinned")
-    pri   = entity.get("e.priority")
-    mens  = entity.get("e.mention_count")
+    pin   = entity.get("e.pinned_target")
+    pin_note = f"  [pinned:{pin}]" if pin else ""
 
     lines = [
         f"[{etype}] {name}",
         f"  UUID:        {uuid}",
-        f"  Pinned:      {pin}  |  Priority: {pri}  |  Mentions: {mens}",
+        f"  Pinned:      {pin_note or '(not pinned)'}  |  Priority: {pri}  |  Mentions: {mens}",
         f"  Description: {desc}",
     ]
     out_edges = entity.get("edges_out", [])
@@ -415,7 +438,7 @@ async def kg_list(entity_type: str = "", pinned_only: bool = False) -> str:
 
     lines = []
     for e in entities:
-        pin = "  [pinned]" if e.get("pinned") else ""
+        pin = f"  [pinned:{e.get('pinned_target')}]" if e.get("pinned_target") else ""
         lines.append(
             f"[{e['entity_type']}] {e['name']} (UUID: {e['uuid']}){pin}  priority: {e['priority']}\n"
             f"  {e['description']}"

@@ -71,6 +71,7 @@ _graph_db:       object | None = None
 _tools:          "ModuleType | None" = None
 _pinned_prio:    int = 5
 _token_budget:   int = 4096
+_pinned_user_scan: int = 3
 _graph_embedder: object | None = None  # embedder for dedup; falls back to search embedder
 
 
@@ -382,7 +383,7 @@ def _count_entry_tokens(entry) -> int:
 # ---------------------------------------------------------------------------
 
 def register_runtime(runtime) -> None:
-    global _graph_database, _runner, _workspace, _graph_db, _tools, _pinned_prio, _token_budget, _graph_embedder
+    global _graph_database, _runner, _workspace, _graph_db, _tools, _pinned_prio, _token_budget, _pinned_user_scan, _graph_embedder
 
     _workspace = Path(runtime.config.workspace.path).expanduser().resolve()
     _workspace.mkdir(parents=True, exist_ok=True)
@@ -414,6 +415,7 @@ def register_runtime(runtime) -> None:
 
     _pinned_prio  = int(cfg.get("pinned_priority", 5))
     _token_budget = int(cfg.get("memory_block_tokens", 4096))
+    _pinned_user_scan = int(cfg.get("pinned_user_scan", 3))
 
     # GraphDatabase — single owner of the ladybug.Database
     from TinyCTX.modules.memory.graph import GraphDatabase, GraphDB
@@ -538,6 +540,28 @@ def register_runtime(runtime) -> None:
 
 
 # ---------------------------------------------------------------------------
+# _active_users_from_dialogue — collect recent participants
+# ---------------------------------------------------------------------------
+
+def _active_users_from_dialogue(dialogue: list, scan: int) -> set[str]:
+    """
+    Walk dialogue backwards, collecting author_id from user-role entries.
+    Stop after finding `scan` distinct user messages.
+    Returns a set of TinyCTX usernames seen in those recent turns.
+    """
+    from TinyCTX.context import ROLE_USER
+    active: set[str] = set()
+    count = 0
+    for entry in reversed(dialogue):
+        if entry.role == ROLE_USER and entry.author_id:
+            active.add(entry.author_id)
+            count += 1
+            if count >= scan:
+                break
+    return active
+
+
+# ---------------------------------------------------------------------------
 # register_agent — per AgentCycle
 # ---------------------------------------------------------------------------
 
@@ -621,13 +645,25 @@ def register_agent(cycle) -> None:
     # Pinned entity memory block
     # ------------------------------------------------------------------
 
-    def _build_memory_block(gdb, budget: int) -> str | None:
+    def _build_memory_block(gdb, budget: int, active_users: set[str]) -> str | None:
         pinned = gdb.get_pinned_entities_full()
         if not pinned:
             return None
 
         def _get(e: dict, field: str) -> str:
             return str(e.get(f"e.{field}", e.get(field, "")) or "")
+
+        # Filter by pinned_target: global always included, user-scoped only
+        # when that username appears in the recent active_users set.
+        def _is_visible(e: dict) -> bool:
+            target = _get(e, "pinned_target")
+            if target == "global":
+                return True
+            return target in active_users
+
+        pinned = [e for e in pinned if _is_visible(e)]
+        if not pinned:
+            return None
 
         pinned_uuids: set[str] = {_get(e, "uuid") for e in pinned}
 
@@ -688,7 +724,11 @@ def register_agent(cycle) -> None:
 
     cycle.context.register_prompt(
         "memory_pinned",
-        lambda _ctx: _build_memory_block(_graph_db, _token_budget),
+        lambda _ctx: _build_memory_block(
+            _graph_db,
+            _token_budget,
+            _active_users_from_dialogue(_ctx.dialogue, _pinned_user_scan),
+        ),
         role="system",
         priority=_pinned_prio,
     )
