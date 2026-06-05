@@ -213,6 +213,26 @@ def save_upload(attachment: Attachment, uploads_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Image conversion helpers
+# ---------------------------------------------------------------------------
+
+def _convert_to_jpeg(data: bytes) -> bytes | None:
+    """Convert image bytes to JPEG using Pillow.  Returns None if unavailable."""
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(data))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG")
+        return buf.getvalue()
+    except ImportError:
+        return None
+    except Exception as exc:
+        logger.warning("Image conversion to JPEG failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Text extraction helpers (soft deps)
 # ---------------------------------------------------------------------------
 
@@ -312,8 +332,20 @@ def build_content_blocks(
                 )
                 continue
             # Inline as image_url block
-            b64 = base64.b64encode(att.data).decode()
+            img_data = att.data
             mime = att.mime_type.split(";")[0].strip()
+            if mime == "image/webp":
+                converted = _convert_to_jpeg(img_data)
+                if converted is not None:
+                    img_data = converted
+                    mime = "image/jpeg"
+                else:
+                    ref_notes.append(
+                        f"[Image uploaded to {saved_path}: {att.filename}"
+                        " — webp not supported by model and Pillow unavailable for conversion]"
+                    )
+                    continue
+            b64 = base64.b64encode(img_data).decode()
             blocks.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:{mime};base64,{b64}"},
