@@ -60,7 +60,7 @@ def nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> tuple[str, s
     """
     Render up to batch_size nodes as '[author]: content' lines.
     Returns (batch_text, agent_name) where agent_name is the last assistant
-    author_name seen in the batch, or 'assistant' if none found.
+    author_id seen in the batch, or 'assistant' if none found.
     """
     lines: list[str] = []
     agent_name = "assistant"
@@ -68,9 +68,9 @@ def nodes_to_text(conv_db, node_ids: list[str], batch_size: int) -> tuple[str, s
         node = conv_db.get_node(node_id)
         if node is None or node.role not in ("user", "assistant"):
             continue
-        author  = node.author_name or node.author_id or node.role
-        if node.role == "assistant" and node.author_name:
-            agent_name = node.author_name
+        author = node.author_id or node.role
+        if node.role == "assistant" and node.author_id:
+            agent_name = node.author_id
         content = node.content or ""
         if content.startswith("["):
             try:

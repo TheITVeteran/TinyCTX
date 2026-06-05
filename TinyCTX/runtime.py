@@ -179,7 +179,6 @@ class Runtime:
             role="user",
             content=content_str,
             author_id=msg.author.username,
-            author_name=None,
             state_delta=json.dumps(state_delta) if state_delta else None,
         )
         
