@@ -52,6 +52,13 @@ RULES
   Person, Concept, Preference, Fact, Event, Location, Organization,
   Project, Technology, Rule, Directive, Role
 - Use UPPER_SNAKE_CASE for relation names.
+- NEVER use SAID as a relation type. "X said something about Y" is not a durable
+  graph relationship. If X has a meaningful connection to Y (knows them, likes them,
+  works with them), use the appropriate structural relation instead. If there is no
+  durable connection, create no edge at all.
+- NEVER create multiple edges of the same relation type between the same two nodes.
+  Before adding a relationship, check whether one already exists via kg_search or
+  the existing entity state. If it exists, do not add another.
 - Prefer existing relation types when they fit. Existing types in this graph:
   {relation_vocab}
   Only introduce a new relation type if none of the above are a reasonable fit, and ONLY if it represents a structural verb.

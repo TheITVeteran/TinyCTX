@@ -131,7 +131,71 @@ async def _aset(conn, uid: str, field: str, value):
     return await conn.execute(
         f"MATCH (e:Entity) WHERE e.uuid = $uid SET e.{field} = $v",
         parameters={"uid": uid, "v": value},
-    )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Edge dedup — delete duplicate active edges
+# ---------------------------------------------------------------------------
+
+async def run_edge_dedup(
+    conn,
+    write_lock: asyncio.Lock,
+    agent_logger: logging.Logger,
+) -> None:
+    """
+    Find and delete duplicate active edges.
+
+    A duplicate is defined as two or more active (superseded_at IS NULL) edges
+    sharing the same (source uuid, target uuid, relation) triple. For each
+    such group, the most recently created edge is kept and the rest are deleted.
+    """
+    logger.info("[memory/librarian] edge dedup starting")
+    try:
+        # Fetch all active edges with their internal IDs.
+        # Ladybug exposes the internal edge ID via id(r).
+        r = await conn.execute(
+            "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
+            "WHERE r.superseded_at IS NULL "
+            "RETURN id(r), a.uuid, b.uuid, r.relation, r.created_at"
+        )
+
+        # Group by (src_uuid, tgt_uuid, relation)
+        from collections import defaultdict
+        groups: dict[tuple, list[tuple]] = defaultdict(list)  # key -> [(edge_id, created_at)]
+        while r.has_next():
+            row = r.get_next()
+            edge_id, src, tgt, rel, created_at = row
+            groups[(src, tgt, rel)].append((edge_id, created_at or 0.0))
+
+        to_delete: list = []
+        for (src, tgt, rel), edges in groups.items():
+            if len(edges) <= 1:
+                continue
+            # Sort by created_at descending — keep the newest, delete the rest.
+            edges.sort(key=lambda x: x[1], reverse=True)
+            to_delete.extend(eid for eid, _ in edges[1:])
+
+        if not to_delete:
+            logger.info("[memory/librarian] edge dedup: no duplicate edges found")
+            return
+
+        logger.info("[memory/librarian] edge dedup: deleting %d duplicate edge(s)", len(to_delete))
+        agent_logger.info("[edge dedup] deleting %d duplicate edges", len(to_delete))
+
+        async with write_lock:
+            for edge_id in to_delete:
+                try:
+                    await conn.execute(
+                        "MATCH ()-[r:Relation]->() WHERE id(r) = $eid DELETE r",
+                        parameters={"eid": edge_id},
+                    )
+                except Exception as exc:
+                    logger.warning("[memory/librarian] edge dedup: failed to delete edge %s: %s", edge_id, exc)
+
+        logger.info("[memory/librarian] edge dedup complete")
+    except Exception:
+        logger.exception("[memory/librarian] edge dedup error")
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +400,7 @@ async def run_dedup_cycle(
 
         logger.info("[memory/librarian] dedup cycle complete")
     except Exception:
-        logger.exception("[memory/librarian] dedup cycle error")
+        logger.exception("[memory/librarian] dedup cycle error")
 
 
 # ---------------------------------------------------------------------------
@@ -526,5 +590,5 @@ async def _apply_verdict(
                 f"CREATE (a)-[:Relation {{relation: 'ALIASED_TO', weight: 1.0, "
                 f"description: 'alias', created_at: {now!r}, superseded_at: null}}]->(c)",
                 parameters={"alias": dup_uuid, "canon": canonical_uuid},
-            )
-
+            )
+

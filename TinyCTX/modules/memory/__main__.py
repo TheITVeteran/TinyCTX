@@ -193,6 +193,7 @@ class LibrarianRunner:
             run_buffer_agent, run_targeted_agent, run_dedup_cycle,
             nodes_to_text,
         )
+        from TinyCTX.modules.memory.dedup_agents import run_edge_dedup
 
         # Reap finished tasks
         done = {t for t in self._active_tasks if t.done()}
@@ -292,20 +293,36 @@ class LibrarianRunner:
             dedup_enabled
             and not self._state["dedup_running"]
             and (now - self._state["last_dedup_ts"]) >= dedup_interval
-            and self._embedder is not None
             and len(self._active_tasks) < max_concurrent
         ):
             self._state["dedup_running"] = True
             self._state["last_dedup_ts"] = now
+
+            # Edge dedup runs unconditionally — no embedder required.
             t = asyncio.create_task(
-                run_dedup_cycle(
-                    self._cfg, _workspace, self._write_conn, self._write_lock,
-                    self._llm, self._graph_embedder, self.agent_logger,
+                run_edge_dedup(
+                    self._write_conn, self._write_lock, self.agent_logger,
                 )
             )
-            t.add_done_callback(lambda _: self._state.__setitem__("dedup_running", False))
             t.add_done_callback(self._checkpoint_callback)
             self._active_tasks.add(t)
+
+            # Entity dedup requires an embedder.
+            if (
+                self._embedder is not None
+                and len(self._active_tasks) < max_concurrent
+            ):
+                t = asyncio.create_task(
+                    run_dedup_cycle(
+                        self._cfg, _workspace, self._write_conn, self._write_lock,
+                        self._llm, self._graph_embedder, self.agent_logger,
+                    )
+                )
+                t.add_done_callback(lambda _: self._state.__setitem__("dedup_running", False))
+                t.add_done_callback(self._checkpoint_callback)
+                self._active_tasks.add(t)
+            else:
+                self._state["dedup_running"] = False
 
 
 # ---------------------------------------------------------------------------

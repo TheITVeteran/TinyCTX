@@ -215,6 +215,8 @@ async def kg_add_relationship(
 ) -> str:
     """
     Add a directed relationship between two entities.
+    No-op if an active edge with the same relation already exists between
+    these two entities — returns the existing edge instead.
 
     Args:
         source_uuid: UUID of the source entity.
@@ -228,8 +230,26 @@ async def kg_add_relationship(
     src_name   = src_entity["name"] if src_entity else source_uuid
     tgt_name   = tgt_entity["name"] if tgt_entity else target_uuid
 
+    rel = relation.upper().replace("'", "")
+
+    # Check for existing active edge with the same relation type.
+    existing = await _conn.execute(
+        f"MATCH (a:Entity)-[r:Relation]->(b:Entity) "
+        f"WHERE a.uuid = $src AND b.uuid = $tgt "
+        f"AND r.relation = '{rel}' AND r.superseded_at IS NULL "
+        f"RETURN r.weight, r.description LIMIT 1",
+        parameters={"src": source_uuid, "tgt": target_uuid},
+    )
+    if existing.has_next():
+        row = existing.get_next()
+        ex_w, ex_desc = row[0], row[1]
+        ex_note = f" — {ex_desc}" if ex_desc else ""
+        return (
+            f"Relationship already exists: '{src_name}' -[{rel}]-> '{tgt_name}' "
+            f"(w={ex_w}){ex_note}. Use kg_delete_relationship then kg_add_relationship to replace it."
+        )
+
     now  = now_ts()
-    rel  = relation.upper().replace("'", "")
     desc = description.replace("'", "''")
     async with _write_lock:
         await _conn.execute(
