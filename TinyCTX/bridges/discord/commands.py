@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import discord
 from discord import app_commands
+from TinyCTX.contracts import Platform
 
 if TYPE_CHECKING:
     from TinyCTX.bridges.discord.bridge import DiscordBridge
@@ -82,9 +83,25 @@ async def sync_app_commands(bridge: "DiscordBridge") -> None:
 
         for sub_name, (desc, ns, sub) in named_subs.items():
             def _make_sub(ns: str, sub: str, desc: str) -> None:
-                @group.command(name=sub, description=desc)
-                async def _sub_handler(interaction: discord.Interaction) -> None:  # noqa: F841
-                    await handle_command_interaction(bridge, interaction, ns, sub)
+                if ns == "user" and sub == "grant":
+                    @group.command(name=sub, description=desc)
+                    @app_commands.describe(username="TinyCTX username", level="Permission level (0-100)")
+                    async def _sub_handler(interaction: discord.Interaction, username: str, level: int) -> None:  # noqa: F841
+                        await handle_user_grant_interaction(bridge, interaction, username, level)
+                elif ns == "user" and sub == "info":
+                    @group.command(name=sub, description=desc)
+                    @app_commands.describe(username="TinyCTX username")
+                    async def _sub_handler(interaction: discord.Interaction, username: str) -> None:  # noqa: F841
+                        await handle_user_info_interaction(bridge, interaction, username)
+                elif ns == "user" and sub == "rename":
+                    @group.command(name=sub, description=desc)
+                    @app_commands.describe(username="Current username", new_username="New username")
+                    async def _sub_handler(interaction: discord.Interaction, username: str, new_username: str) -> None:  # noqa: F841
+                        await handle_user_rename_interaction(bridge, interaction, username, new_username)
+                else:
+                    @group.command(name=sub, description=desc)
+                    async def _sub_handler(interaction: discord.Interaction) -> None:  # noqa: F841
+                        await handle_command_interaction(bridge, interaction, ns, sub)
 
             _make_sub(ns, sub_name, desc)
 
@@ -192,6 +209,103 @@ async def handle_shutdown_interaction(
             await interaction.followup.send(
                 f"⚠️ Shutdown failed: {exc}", ephemeral=True
             )
+
+
+async def handle_user_grant_interaction(
+    bridge: "DiscordBridge",
+    interaction: discord.Interaction,
+    username: str,
+    level: int,
+) -> None:
+    """Handle /user modify_permissions (formerly grant) with typed Discord params."""
+    await interaction.response.defer(ephemeral=True)
+    caller_user = bridge._runtime.users.resolve_user(
+        platform=Platform.DISCORD,
+        user_id=str(interaction.user.id),
+        username=interaction.user.name,
+        display_name=interaction.user.display_name,
+    )
+    if caller_user is None:
+        await interaction.followup.send("⛔ Cannot resolve your identity.", ephemeral=True)
+        return
+
+    caller_level = caller_user.permission_level
+    max_grantable = caller_level - 1
+    if not (0 <= level <= 100):
+        await interaction.followup.send("⛔ Level must be between 0 and 100.", ephemeral=True)
+        return
+    if level > max_grantable:
+        await interaction.followup.send(
+            f"⛔ Cannot set level {level} — you may only grant up to {max_grantable} (your level − 1).",
+            ephemeral=True,
+        )
+        return
+    user = bridge._runtime.users.get_user(username)
+    if user is None:
+        await interaction.followup.send(f"User {username!r} not found.", ephemeral=True)
+        return
+    if user.permission_level >= caller_level:
+        await interaction.followup.send(
+            f"⛔ {username!r} is at level {user.permission_level} — not below your level ({caller_level}).",
+            ephemeral=True,
+        )
+        return
+    old = user.permission_level
+    user.permission_level = level
+    bridge._runtime.users.update_user(user)
+    logger.info(
+        "[discord] user_grant: %s → level %d (was %d, caller_level=%d)",
+        username, level, old, caller_level,
+    )
+    await interaction.followup.send(f"✅ {username}: {old} → {level}", ephemeral=True)
+
+
+async def handle_user_info_interaction(
+    bridge: "DiscordBridge",
+    interaction: discord.Interaction,
+    username: str,
+) -> None:
+    """Handle /user info with a typed username param."""
+    await interaction.response.defer(ephemeral=True)
+    user = bridge._runtime.users.get_user(username)
+    if user is None:
+        await interaction.followup.send(f"User {username!r} not found.", ephemeral=True)
+        return
+    identities = ", ".join(
+        f"{i.platform.value}:{i.user_id} ({i.username})" for i in user.identities
+    ) or "none"
+    await interaction.followup.send(
+        f"**{user.username}** — level {user.permission_level}\n"
+        f"Identities: {identities}",
+        ephemeral=True,
+    )
+
+
+async def handle_user_rename_interaction(
+    bridge: "DiscordBridge",
+    interaction: discord.Interaction,
+    username: str,
+    new_username: str,
+) -> None:
+    """Handle /user rename with typed params."""
+    await interaction.response.defer(ephemeral=True)
+    caller_user = bridge._runtime.users.resolve_user(
+        platform=Platform.DISCORD,
+        user_id=str(interaction.user.id),
+        username=interaction.user.name,
+        display_name=interaction.user.display_name,
+    )
+    if caller_user is None or caller_user.permission_level < 100:
+        await interaction.followup.send("⛔ Requires level 100.", ephemeral=True)
+        return
+    from TinyCTX.users import UsernameConflictError
+    try:
+        updated = bridge._runtime.users.rename_user(username, new_username)
+        await interaction.followup.send(f"✅ Renamed {username!r} → {updated.username!r}", ephemeral=True)
+    except ValueError as e:
+        await interaction.followup.send(f"Error: {e}", ephemeral=True)
+    except UsernameConflictError:
+        await interaction.followup.send(f"Username {new_username!r} is already taken.", ephemeral=True)
 
 
 async def handle_command_interaction(
