@@ -120,14 +120,14 @@ class HistoryEntry:
         return HistoryEntry(role=ROLE_USER, content=content, author_id=author_id)
 
     @staticmethod
-    def assistant(content: str = "", tool_calls: list[ToolCall] | None = None) -> HistoryEntry:
+    def assistant(content: str = "", tool_calls: list[ToolCall] | None = None, author_id: str | None = None) -> HistoryEntry:
         raw_calls = []
         if tool_calls:
             raw_calls = [
                 {"id": tc.call_id, "name": tc.tool_name, "arguments": tc.args}
                 for tc in tool_calls
             ]
-        return HistoryEntry(role=ROLE_ASSISTANT, content=content, tool_calls=raw_calls)
+        return HistoryEntry(role=ROLE_ASSISTANT, content=content, tool_calls=raw_calls, author_id=author_id)
 
     @staticmethod
     def tool_result(result: ToolResult) -> HistoryEntry:

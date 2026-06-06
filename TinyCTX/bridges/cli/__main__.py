@@ -154,6 +154,7 @@ class CLIBridge:
         self._gateway_url: str = ""
         self._api_key: str     = ""
         self._cli_username: str | None = None  # TinyCTX username for this session
+        self._cli_agent_name: str | None = None  # agent_name from bridge config
 
     # --- HTTP helpers ---
 
@@ -375,6 +376,8 @@ class CLIBridge:
         payload: dict = {"node_id": self._cursor, "text": text, "permission_level": 100}
         if self._cli_username:
             payload["cli_username"] = self._cli_username
+        if self._cli_agent_name:
+            payload["agent_name"] = self._cli_agent_name
         if attachments:
             payload["attachments"] = attachments
 
@@ -688,6 +691,7 @@ async def run_detached(
     bridge._gateway_url = gateway_url
     bridge._api_key     = api_key
     bridge._cli_username = username  # forwarded in _send()
+    bridge._cli_agent_name = (options or {}).get("agent_name") or None  # forwarded in _send()
 
     # Resolve or create the cursor via /v1/lane/open.
     saved_cursor = _load_cli_cursor_path()

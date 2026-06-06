@@ -229,6 +229,7 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
         )
 
     reply_to_author = (body.get("reply_to_author") or "").strip() or None
+    agent_name = (body.get("agent_name") or "").strip() or None
 
     msg = InboundMessage(
         tail_node_id=node_id,
@@ -240,6 +241,7 @@ async def handle_lane_message(request: web.Request) -> web.StreamResponse:
         attachments=attachments,
         trigger=True,
         reply_to_author=reply_to_author,
+        agent_name=agent_name,
     )
 
     # Register SSE queue with Runtime before pushing so no events are missed.

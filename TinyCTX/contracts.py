@@ -128,6 +128,7 @@ class InboundMessage:
     trace_id:     str           = field(default_factory=lambda: str(uuid.uuid4()))
     server_name:  str | None    = None          # guild/server name (bridges populate when known)
     channel_name: str | None    = None          # channel/thread name (bridges populate when known)
+    agent_name:   str | None    = None          # display name of the agent in this context (bridge-set)
     # permission_level removed — permissions live on User only (phase 2 enforcement)
 
 

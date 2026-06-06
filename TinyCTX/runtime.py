@@ -252,7 +252,8 @@ class Runtime:
             "platform": msg.author.identities[0].platform.value if msg.author.identities else None,
             "author_id": msg.author.username,
             "server_name": msg.server_name,
-            "channel_name": msg.channel_name
+            "channel_name": msg.channel_name,
+            "agent_name": msg.agent_name,
         }
         for k, v in mapping.items():
             if v is not None and prior_state.get(k) != v:

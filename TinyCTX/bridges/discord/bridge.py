@@ -264,6 +264,16 @@ class DiscordBridge:
     def _dehumanize_mentions(self, text: str) -> str:
         return dehumanize_mentions(text, self._runtime)
 
+    def _bot_display_name(self, guild: discord.Guild | None = None) -> str | None:
+        """Return the bot's display name in the given guild, or globally if no guild."""
+        if self._client.user is None:
+            return None
+        if guild is not None:
+            member = guild.get_member(self._client.user.id)
+            if member is not None:
+                return member.display_name
+        return self._client.user.display_name
+
     # ------------------------------------------------------------------
     # Attachment / forwarded-message helpers
     # ------------------------------------------------------------------
@@ -491,6 +501,7 @@ class DiscordBridge:
                 channel_name=None,
                 trigger=True,
                 reply_to_author=reply_to_author_dm,
+                agent_name=self._bot_display_name(),
             )
             task = asyncio.create_task(
                 _turn_module.handle_turn(self, msg, message.channel, cursor_key)
@@ -568,6 +579,7 @@ class DiscordBridge:
             channel_name=getattr(message.channel, "name", None),
             trigger=is_trigger,
             reply_to_author=reply_to_author_group,
+            agent_name=self._bot_display_name(message.guild),
         )
 
         compat_delay: float = (
@@ -696,6 +708,7 @@ class DiscordBridge:
             channel_name=getattr(thread, "name", None),
             trigger=True,
             reply_to_author=reply_to_author_thread,
+            agent_name=self._bot_display_name(message.guild),
         )
         task = asyncio.create_task(
             _turn_module.handle_turn(self, msg, message.channel, cursor_key)
