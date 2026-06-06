@@ -76,6 +76,31 @@ _graph_embedder: object | None = None  # embedder for dedup; falls back to searc
 
 
 # ---------------------------------------------------------------------------
+# _YieldingLLM — pauses background LLM calls while user cycles are active
+# ---------------------------------------------------------------------------
+
+class _YieldingLLM:
+    """
+    Thin wrapper around LLM that waits for user cycles to finish before
+    each streaming request. Prevents background consolidation from
+    competing with real messages mid-generation.
+    """
+
+    def __init__(self, llm, is_busy_fn):
+        self._llm = llm
+        self._is_busy = is_busy_fn  # callable() -> bool
+
+    async def stream(self, messages, tools=None):
+        while self._is_busy():
+            await asyncio.sleep(1)
+        async for event in self._llm.stream(messages, tools):
+            yield event
+
+    def __getattr__(self, name):
+        return getattr(self._llm, name)
+
+
+# ---------------------------------------------------------------------------
 # LibrarianRunner — in-process background task
 # ---------------------------------------------------------------------------
 
@@ -97,6 +122,7 @@ class LibrarianRunner:
         llm,
         embedder,
         graph_embedder=None,
+        runtime=None,
     ) -> None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -107,11 +133,14 @@ class LibrarianRunner:
         self._write_lock = asyncio.Lock()
 
         self._conv_db       = conv_db
-        self._llm           = llm
         self._embedder      = embedder
+        self._runtime       = runtime  # used to yield to user-facing cycles
         # graph_embedder is used exclusively for dedup similarity.
         # Falls back to the regular search embedder when None.
         self._graph_embedder = graph_embedder if graph_embedder is not None else embedder
+
+        # Wrap the LLM so background calls pause while user cycles are active.
+        self._llm = _YieldingLLM(llm, self._user_cycles_active)
 
         # Dedicated file logger for all librarian agent text output
         self.agent_logger = logging.getLogger("memory.librarian.agent")
@@ -188,6 +217,10 @@ class LibrarianRunner:
         """
         self._graph_database.checkpoint()
 
+    def _user_cycles_active(self) -> bool:
+        """True when at least one user-facing AgentCycle is running."""
+        return self._runtime is not None and self._runtime._active > 0
+
     async def _poll_cycle(self) -> None:
         from TinyCTX.modules.memory.librarian_agents import (
             run_buffer_agent, run_targeted_agent, run_dedup_cycle,
@@ -255,10 +288,13 @@ class LibrarianRunner:
                 elif tail_id:
                     logger.warning("[memory/librarian] concurrency cap reached, dropping branch msg for %s", tail_id[:8])
 
-        # Node walk on schedule
+        # Node walk on schedule — skip when user cycles are active
         now = time.time()
         interval_secs = float(self._cfg.get("trigger_interval_hours", 6)) * 3600
-        if (now - self._state["last_poll_ts"]) >= interval_secs:
+        if (
+            not self._user_cycles_active()
+            and (now - self._state["last_poll_ts"]) >= interval_secs
+        ):
             self._state["last_poll_ts"] = now
 
             async with self._write_lock:
@@ -286,11 +322,12 @@ class LibrarianRunner:
                 self._active_tasks.add(t)
                 logger.info("[memory/librarian] dispatched agent for %d node(s)", len(flagged_ids))
 
-        # Dedup on schedule
+        # Dedup on schedule — skip when user cycles are active
         dedup_enabled  = bool(self._cfg.get("dedup_enabled", True))
         dedup_interval = float(self._cfg.get("dedup_interval_hours", 24)) * 3600
         if (
             dedup_enabled
+            and not self._user_cycles_active()
             and not self._state["dedup_running"]
             and (now - self._state["last_dedup_ts"]) >= dedup_interval
             and len(self._active_tasks) < max_concurrent
@@ -494,7 +531,7 @@ def register_runtime(runtime) -> None:
     atexit.register(conv_db.close)
 
     # LibrarianRunner — gets write conn from GraphDatabase
-    _runner = LibrarianRunner(cfg, _graph_database, log_path, conv_db, llm, embedder, graph_embedder)
+    _runner = LibrarianRunner(cfg, _graph_database, log_path, conv_db, llm, embedder, graph_embedder, runtime=runtime)
 
     # GraphDB — gets read conn from GraphDatabase
     _graph_db = GraphDB(_graph_database)

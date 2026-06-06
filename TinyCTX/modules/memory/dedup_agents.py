@@ -152,29 +152,27 @@ async def run_edge_dedup(
     """
     logger.info("[memory/librarian] edge dedup starting")
     try:
-        # Fetch all active edges with their internal IDs.
-        # Ladybug exposes the internal edge ID via id(r).
+        # Fetch all active edges grouped by (src_uuid, tgt_uuid, relation).
         r = await conn.execute(
             "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
             "WHERE r.superseded_at IS NULL "
-            "RETURN id(r), a.uuid, b.uuid, r.relation, r.created_at"
+            "RETURN a.uuid, b.uuid, r.relation, r.created_at"
         )
 
-        # Group by (src_uuid, tgt_uuid, relation)
         from collections import defaultdict
-        groups: dict[tuple, list[tuple]] = defaultdict(list)  # key -> [(edge_id, created_at)]
+        groups: dict[tuple, list[tuple]] = defaultdict(list)  # key -> [(created_at,)]
         while r.has_next():
             row = r.get_next()
-            edge_id, src, tgt, rel, created_at = row
-            groups[(src, tgt, rel)].append((edge_id, created_at or 0.0))
+            src, tgt, rel, created_at = row
+            groups[(src, tgt, rel)].append((created_at or 0.0,))
 
-        to_delete: list = []
+        to_delete: list = []  # list of (src, tgt, rel, created_at)
         for (src, tgt, rel), edges in groups.items():
             if len(edges) <= 1:
                 continue
             # Sort by created_at descending — keep the newest, delete the rest.
-            edges.sort(key=lambda x: x[1], reverse=True)
-            to_delete.extend(eid for eid, _ in edges[1:])
+            edges.sort(key=lambda x: x[0], reverse=True)
+            to_delete.extend((src, tgt, rel, ca) for (ca,) in edges[1:])
 
         if not to_delete:
             logger.info("[memory/librarian] edge dedup: no duplicate edges found")
@@ -184,14 +182,17 @@ async def run_edge_dedup(
         agent_logger.info("[edge dedup] deleting %d duplicate edges", len(to_delete))
 
         async with write_lock:
-            for edge_id in to_delete:
+            for (src, tgt, rel, created_at) in to_delete:
                 try:
                     await conn.execute(
-                        "MATCH ()-[r:Relation]->() WHERE id(r) = $eid DELETE r",
-                        parameters={"eid": edge_id},
+                        "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
+                        "WHERE a.uuid = $src AND b.uuid = $tgt "
+                        "AND r.relation = $rel AND r.created_at = $ca "
+                        "DELETE r",
+                        parameters={"src": src, "tgt": tgt, "rel": rel, "ca": created_at},
                     )
                 except Exception as exc:
-                    logger.warning("[memory/librarian] edge dedup: failed to delete edge %s: %s", edge_id, exc)
+                    logger.warning("[memory/librarian] edge dedup: failed to delete edge %s->%s [%s] @ %s: %s", src, tgt, rel, created_at, exc)
 
         logger.info("[memory/librarian] edge dedup complete")
     except Exception:
