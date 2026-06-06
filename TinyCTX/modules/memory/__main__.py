@@ -543,6 +543,7 @@ def register_runtime(runtime) -> None:
         _runner._write_conn, _runner._write_lock, _graph_db, embedder,
         query_template=cfg.get("embed_query_template", "{text}"),
         doc_template=cfg.get("embed_document_template", "{text}"),
+        bm25_weight=float(cfg.get("bm25_weight", 0.4)),
     )
 
     # Shutdown: stop writer → close read conn → checkpoint + close DB.
