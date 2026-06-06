@@ -308,7 +308,7 @@ async def kg_delete_relationship(src_uuid: str, tgt_uuid: str, relation: str) ->
     return f"Deleted relationship: '{src_name}' -[{rel}]-> '{tgt_name}'."
 
 
-async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
+async def kg_search(query: str, top_k: int = 3, semantic: bool = True) -> str:
     """
     Search the knowledge graph for entities relevant to a query.
     Returns matching entities with their direct active relationships.
@@ -319,7 +319,7 @@ async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
 
     Args:
         query: Natural language query or keywords to search for.
-        top_k: Maximum number of entities to return (default 5).
+        top_k: Maximum number of entities to return (default 3).
         semantic: If true (default), use vector similarity search.
             If false or no embedding model configured, uses keyword search.
     """
