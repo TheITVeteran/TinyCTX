@@ -161,7 +161,7 @@ async def kg_update_entity(
         pinned_target: TinyCTX username to target. Only used when pinned="user".
     """
     if description is None and priority is None and pinned is None:
-        return f"No fields to update — nothing changed for UUID {uuid}."
+        return f"Warning: kg_update_entity called with no fields — nothing changed for UUID {uuid}. You must provide at least one of: description, priority, pinned."
 
     entity = _graph_db.get_entity(uuid)
     if not entity:
@@ -196,7 +196,7 @@ async def kg_update_entity(
             lines.append(f"  Description was: {old_desc}")
             lines.append(f"  Description now: {description}")
         else:
-            lines.append("  Description: unchanged")
+            lines.append("  Warning: description passed to kg_update_entity is identical to the existing description — no change made. Write a genuinely updated description.")
     if priority is not None:
         lines.append(f"  Priority: {old_pri} → {priority}")
     if pinned is not None:
