@@ -469,7 +469,7 @@ async def _dedup_pair(
         logger.warning("[memory/librarian] dedup: invalid canonical_uuid in verdict")
         return "distinct"
 
-    await _apply_verdict(conn, write_lock, ea, eb, verdict, canonical_uuid, merged_desc)
+    await _apply_verdict(ea, eb, verdict, canonical_uuid, merged_desc)
     return verdict
 
 
@@ -550,7 +550,7 @@ async def _dedup_batch(
             results.append((pair_key, "distinct", False))
             continue
 
-        await _apply_verdict(conn, write_lock, ea, eb, verdict, canonical_uuid, merged_desc)
+        await _apply_verdict(ea, eb, verdict, canonical_uuid, merged_desc)
         results.append((pair_key, verdict, True))
 
     return results
@@ -561,54 +561,17 @@ async def _dedup_batch(
 # ---------------------------------------------------------------------------
 
 async def _apply_verdict(
-    conn,
-    write_lock: asyncio.Lock,
     ea: dict,
     eb: dict,
     verdict: str,
     canonical_uuid: str,
     merged_desc: str,
 ) -> None:
-    from TinyCTX.modules.memory.graph import now_ts
-
-    dup_uuid = eb["e.uuid"] if canonical_uuid == ea["e.uuid"] else ea["e.uuid"]
-    now      = now_ts()
-
-    async with write_lock:
-        if verdict == "duplicate":
-            logger.info("[memory/librarian] dedup: merging %s -> %s", dup_uuid[:8], canonical_uuid[:8])
-            await _aset(conn, canonical_uuid, "description", merged_desc)
-            await _aset(conn, canonical_uuid, "updated_at",  now)
-            await _aset(conn, canonical_uuid, "embed_hash",  "")
-            await conn.execute(
-                "MATCH (dup:Entity)-[r:Relation]->(x:Entity), (c:Entity) "
-                "WHERE dup.uuid = $dup AND r.superseded_at IS NULL "
-                "AND x.uuid <> $canon AND c.uuid = $canon "
-                "CREATE (c)-[:Relation {relation: r.relation, weight: r.weight, "
-                "description: r.description, created_at: r.created_at, superseded_at: null}]->(x)",
-                parameters={"dup": dup_uuid, "canon": canonical_uuid},
-            )
-            await conn.execute(
-                "MATCH (x:Entity)-[r:Relation]->(dup:Entity), (c:Entity) "
-                "WHERE dup.uuid = $dup AND r.superseded_at IS NULL "
-                "AND x.uuid <> $canon AND c.uuid = $canon "
-                "CREATE (x)-[:Relation {relation: r.relation, weight: r.weight, "
-                "description: r.description, created_at: r.created_at, superseded_at: null}]->(c)",
-                parameters={"dup": dup_uuid, "canon": canonical_uuid},
-            )
-            await conn.execute(
-                "MATCH (e:Entity) WHERE e.uuid = $uid DETACH DELETE e",
-                parameters={"uid": dup_uuid},
-            )
-        elif verdict == "alias":
-            logger.info("[memory/librarian] dedup: aliasing %s -> %s", dup_uuid[:8], canonical_uuid[:8])
-            await _aset(conn, dup_uuid, "description", merged_desc)
-            await _aset(conn, dup_uuid, "updated_at",  now)
-            await conn.execute(
-                f"MATCH (a:Entity), (c:Entity) "
-                f"WHERE a.uuid = $alias AND c.uuid = $canon "
-                f"CREATE (a)-[:Relation {{relation: 'ALIASED_TO', weight: 1.0, "
-                f"description: 'alias', created_at: {now!r}, superseded_at: null}}]->(c)",
-                parameters={"alias": dup_uuid, "canon": canonical_uuid},
-            )
+    import TinyCTX.modules.memory.tools as tools
+    await tools.kg_merge_entities(
+        canonical=canonical_uuid,
+        duplicate=eb["e.uuid"] if canonical_uuid == ea["e.uuid"] else ea["e.uuid"],
+        merged_description=merged_desc,
+        verdict=verdict,
+    )
 

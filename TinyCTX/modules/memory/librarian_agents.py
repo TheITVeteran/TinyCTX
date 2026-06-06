@@ -99,6 +99,7 @@ def _make_tool_handler():
         tools.kg_search,
         tools.kg_add_entity,
         tools.kg_update_entity,
+        tools.kg_merge_entities,
         tools.kg_add_relationship,
         tools.kg_delete_entity,
         tools.kg_delete_relationship,

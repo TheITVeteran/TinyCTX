@@ -500,6 +500,108 @@ async def kg_list(entity_type: str = "", pinned_only: bool = False) -> str:
     return "\n\n".join(lines)
 
 
+def _resolve_entity(uuid_or_name: str) -> dict | None:
+    """Return entity_slim dict by UUID or exact name, or None if not found."""
+    e = _graph_db.get_entity_slim(uuid_or_name)
+    if e:
+        return e
+    matches = _graph_db.find_entity(name=uuid_or_name)
+    exact = next((m for m in matches if m["name"].lower() == uuid_or_name.lower()), None)
+    return exact  # already a slim dict (uuid, name, entity_type)
+
+
+async def kg_merge_entities(
+    canonical: str,
+    duplicate: str,
+    merged_description: str,
+    verdict: str = "duplicate",
+) -> str:
+    """
+    Merge two knowledge graph entities.
+
+    Use when you identify that two nodes refer to the same real-world thing.
+    All edges from the duplicate are re-pointed to the canonical node, then
+    the duplicate is deleted (verdict="duplicate") or linked via ALIASED_TO
+    (verdict="alias").
+
+    Args:
+        canonical: UUID or exact name of the node to keep as the authoritative entity.
+        duplicate: UUID or exact name of the node to absorb or alias.
+        merged_description: Consolidated description combining facts from both nodes.
+        verdict: "duplicate" (delete the dup, reparent its edges) or
+                 "alias" (keep both, add ALIASED_TO edge from dup to canonical).
+    """
+    if verdict not in ("duplicate", "alias"):
+        return f"Error: verdict must be 'duplicate' or 'alias', got '{verdict}'."
+
+    canon_e = _resolve_entity(canonical)
+    dup_e   = _resolve_entity(duplicate)
+    if not canon_e:
+        return f"Error: canonical entity '{canonical}' not found."
+    if not dup_e:
+        return f"Error: duplicate entity '{duplicate}' not found."
+
+    canonical_uuid = canon_e["uuid"]
+    duplicate_uuid = dup_e["uuid"]
+
+    if canonical_uuid == duplicate_uuid:
+        return "Error: canonical and duplicate resolve to the same entity."
+
+    canon_name = canon_e["name"]
+    dup_name   = dup_e["name"]
+    now        = now_ts()
+
+    async with _write_lock:
+        if verdict == "duplicate":
+            await _aset(canonical_uuid, "description", merged_description)
+            await _aset(canonical_uuid, "updated_at",  now)
+            await _aset(canonical_uuid, "embed_hash",  "")
+            # Re-point outgoing edges from dup to canon
+            await _conn.execute(
+                "MATCH (dup:Entity)-[r:Relation]->(x:Entity), (c:Entity) "
+                "WHERE dup.uuid = $dup AND r.superseded_at IS NULL "
+                "AND x.uuid <> $canon AND c.uuid = $canon "
+                "CREATE (c)-[:Relation {relation: r.relation, weight: r.weight, "
+                "description: r.description, created_at: r.created_at, superseded_at: null}]->(x)",
+                parameters={"dup": duplicate_uuid, "canon": canonical_uuid},
+            )
+            # Re-point incoming edges to dup over to canon
+            await _conn.execute(
+                "MATCH (x:Entity)-[r:Relation]->(dup:Entity), (c:Entity) "
+                "WHERE dup.uuid = $dup AND r.superseded_at IS NULL "
+                "AND x.uuid <> $canon AND c.uuid = $canon "
+                "CREATE (x)-[:Relation {relation: r.relation, weight: r.weight, "
+                "description: r.description, created_at: r.created_at, superseded_at: null}]->(c)",
+                parameters={"dup": duplicate_uuid, "canon": canonical_uuid},
+            )
+            await _conn.execute(
+                "MATCH (e:Entity) WHERE e.uuid = $uid DETACH DELETE e",
+                parameters={"uid": duplicate_uuid},
+            )
+            return (
+                f"Merged '{dup_name}' ({duplicate_uuid}) into '{canon_name}' ({canonical_uuid}).\n"
+                f"  Edges reparented and duplicate deleted.\n"
+                f"  Description: {merged_description}"
+            )
+        else:  # alias
+            await _aset(duplicate_uuid, "description", f"This node is aliased to {canon_name}. The UUID for that node is {canonical_uuid}.")
+            await _aset(duplicate_uuid, "updated_at",  now)
+            await _aset(canonical_uuid, "description", merged_description)
+            await _aset(canonical_uuid, "updated_at",  now)
+            await _aset(canonical_uuid, "embed_hash",  "")
+            await _conn.execute(
+                f"MATCH (a:Entity), (c:Entity) "
+                f"WHERE a.uuid = $alias AND c.uuid = $canon "
+                f"CREATE (a)-[:Relation {{relation: 'ALIASED_TO', weight: 1.0, "
+                f"description: 'alias', created_at: {now!r}, superseded_at: null}}]->(c)",
+                parameters={"alias": duplicate_uuid, "canon": canonical_uuid},
+            )
+            return (
+                f"Aliased '{dup_name}' ({duplicate_uuid}) -> '{canon_name}' ({canonical_uuid}).\n"
+                f"  Canonical description updated: {merged_description}\n"
+                f"  Alias node description set to redirect stub."
+            )
+
 async def kg_stats() -> str:
     """
     Show knowledge graph statistics: entity count, edge count, pinned entities,
