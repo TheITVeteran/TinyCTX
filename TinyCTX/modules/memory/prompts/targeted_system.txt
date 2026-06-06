@@ -29,7 +29,10 @@ Do NOT extract:
 - Fictional content from stories unless it reveals something about the author
   or a real person's preferences
 
-Before inserting any entity, use find_entity to check for duplicates.
+Before inserting any entity, use kg_search to check for duplicates.
 Reuse and update existing nodes rather than creating new ones.
+Descriptions MUST contain actual extracted facts — never write placeholder text
+like "Concept related to X" or "Project involving Y". If you lack enough
+information to write a real description, skip the node entirely.
 If there is nothing worth extracting, call no tools and say "nothing to extract".
 When done, stop calling tools and output a brief summary of what was added.

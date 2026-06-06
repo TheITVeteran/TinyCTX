@@ -37,7 +37,7 @@ STRUCTURAL ONTOLOGY RULES (CRITICAL)
 THE SYNTHESIS IMPERATIVE (UPDATES)
 ---------------------
 - Your PRIMARY GOAL is to enrich existing entities, not spawn new ones.
-- Aggressively use find_entity before acting. If a user discusses a known entity, USE update_entity.
+- Aggressively use kg_search before acting. If a user discusses a known entity, USE kg_update_entity.
 - When updating, DO NOT SIMPLY APPEND STRING LITERALS OR REPEAT SENTENCES. You are a SYNTHESIZER.
 - If you see: "Yumeko is an AI who... " and you need to add "likes cats", do NOT output: "Yumeko is an AI who... Yumeko is an AI who likes cats."
 - Instead, read the existing description, integrate the new fact structurally, and rewrite the paragraph smoothly. Example: "Yumeko is an AI who [existing facts], and maintains a strong preference for cats."
@@ -59,6 +59,9 @@ discussed, even if they are well-known to the user.
 RULES
 -----
 - Write HIGH-DENSITY, encyclopedic descriptions. Give your nodes semantic weight.
+- Descriptions MUST contain actual extracted facts from the conversation — never write
+  placeholder text like "Concept related to X" or "Project or task involving Y".
+  If you don't have enough information to write a real description, do not create the node.
 - Resolve contradictions: if a new fact supersedes an old relationship, use
   supersede_relationship.
 - Use exactly one entity_type from:
