@@ -60,9 +60,8 @@ async def kg_add_entity(
     entity_type: str,
     description: str,
     priority: int = 40,
-    pinned: bool = False,
-    pinned_type: str = "global",
-    pinned_user: str = "",
+    pinned: str = "",
+    pinned_target: str = "",
 ) -> str:
     """
     Add a new knowledge graph entity. Returns an error if an entity with the
@@ -74,11 +73,11 @@ async def kg_add_entity(
             Location, Organization, Project, Technology, Rule, Directive, Role.
         description: 1-3 sentence factual description.
         priority: 0-100 importance score (default 40).
-        pinned: If true, inject into system prompt based on pinned_type.
-        pinned_type: "global" (always inject) or "user" (inject only when
-            pinned_user is active in the conversation). Only used when pinned=True.
-        pinned_user: TinyCTX username for user-scoped pinning. Only used when
-            pinned=True and pinned_type="user".
+        pinned: Pin scope — "global" (always inject into system prompt) or
+            "user" (inject only when pinned_target user is active). Leave empty
+            to not pin.
+        pinned_target: TinyCTX username of the user to target. Only used when
+            pinned="user".
     """
     now = now_ts()
     r = await _conn.execute(
@@ -116,15 +115,18 @@ async def kg_add_entity(
         )
 
     uid = new_uuid()
-    pinned_target = None
-    if pinned:
-        pinned_target = pinned_user.strip() if pinned_type == "user" and pinned_user.strip() else "global"
+    # Resolve stored pinned_target value
+    stored_pin = None
+    if pinned == "global":
+        stored_pin = "global"
+    elif pinned == "user" and pinned_target.strip():
+        stored_pin = pinned_target.strip()
     async with _write_lock:
         await _conn.execute("CREATE (e:Entity {uuid: $uid})", parameters={"uid": uid})
         await _aset(uid, "name",          name)
         await _aset(uid, "entity_type",   entity_type)
         await _aset(uid, "description",   description)
-        await _aset(uid, "pinned_target", pinned_target)
+        await _aset(uid, "pinned_target", stored_pin)
         await _aset(uid, "priority",      priority)
         await _aset(uid, "mention_count", 0)
         await _aset(uid, "created_at",    now)
@@ -132,7 +134,7 @@ async def kg_add_entity(
         await _aset(uid, "embed_model",   "")
         await _aset(uid, "embed_content", "")
         await _aset(uid, "embed_hash",    "")
-    pin_note = f"  [pinned:{pinned_target}]" if pinned_target else ""
+    pin_note = f"  [pinned:{stored_pin}]" if stored_pin else ""
     return (
         f"Added {entity_type} '{name}' (UUID: {uid}){pin_note}\n"
         f"  Description: {description}\n"
@@ -144,9 +146,8 @@ async def kg_update_entity(
     uuid: str,
     description: str | None = None,
     priority: int | None = None,
-    pinned: bool | None = None,
-    pinned_type: str = "global",
-    pinned_user: str = "",
+    pinned: str | None = None,
+    pinned_target: str = "",
 ) -> str:
     """
     Update fields on an existing entity. Only provided fields are changed.
@@ -155,10 +156,9 @@ async def kg_update_entity(
         uuid: The entity UUID.
         description: New description (optional).
         priority: New priority value (optional).
-        pinned: New pinned state (optional). False clears pinning entirely.
-        pinned_type: "global" or "user". Only used when pinned=True.
-        pinned_user: TinyCTX username for user-scoped pinning. Only used when
-            pinned=True and pinned_type="user".
+        pinned: Pin scope — "global", "user", or "" to clear pinning. Pass
+            None to leave pinning unchanged.
+        pinned_target: TinyCTX username to target. Only used when pinned="user".
     """
     if description is None and priority is None and pinned is None:
         return f"No fields to update — nothing changed for UUID {uuid}."
@@ -181,12 +181,12 @@ async def kg_update_entity(
         if priority is not None:
             await _aset(uuid, "priority", priority)
         if pinned is not None:
-            if not pinned:
-                new_pin = None
-            elif pinned_type == "user" and pinned_user.strip():
-                new_pin = pinned_user.strip()
-            else:
+            if pinned == "global":
                 new_pin = "global"
+            elif pinned == "user" and pinned_target.strip():
+                new_pin = pinned_target.strip()
+            else:  # "" or anything else clears pinning
+                new_pin = None
             await _aset(uuid, "pinned_target", new_pin)
         await _aset(uuid, "updated_at", now)
 
@@ -412,7 +412,9 @@ async def kg_get_entity(uuid: str) -> str:
     etype = entity.get("e.entity_type", "?")
     desc  = entity.get("e.description", "")
     pin   = entity.get("e.pinned_target")
-    pin_note = f"  [pinned:{pin}]" if pin else ""
+    pri  = entity.get("e.priority", "?")
+    mens = entity.get("e.mention_count", 0)
+    pin_note = f"[pinned:{pin}]" if pin else ""
 
     lines = [
         f"[{etype}] {name}",
