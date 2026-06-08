@@ -41,6 +41,9 @@ Available template variables (both templates):
   trusted         — True when the current user has permission_level >= trusted_threshold
                     in the UserStore. True in both DMs and group chats.
                     Read from ctx.state["author_id"] + ctx.state["platform"].
+  time_since_last_message — human-readable elapsed time since the previous user
+                    message (e.g. "42s", "5m", "1h 3m"). Empty string on the
+                    first message in a session or if unavailable.
 
 NOTE: For best cache efficiency, avoid using {{ time }} or {{ date }} inside
 EM.md. Put time-sensitive content in EM_FOOTER.md instead.
@@ -84,7 +87,7 @@ _DEFAULT_FOOTER_TEMPLATE = "<clock>{{ time }}</clock>"
 # Variable builder
 # ---------------------------------------------------------------------------
 
-def _build_variables(agent, ctx=None, trusted_threshold: int = 90) -> dict:
+def _build_variables(agent, ctx=None, trusted_threshold: int = 90, last_message_at: float | None = None) -> dict:
     now         = datetime.now()
     workspace   = Path(agent.config.workspace.path).expanduser().resolve()
     source_root = Path.cwd().resolve()
@@ -111,6 +114,17 @@ def _build_variables(agent, ctx=None, trusted_threshold: int = 90) -> dict:
         except Exception as exc:
             logger.debug("[equipment_manifest] trusted lookup failed: %s", exc)
 
+    # Format time since last message
+    time_since_last_message = ""
+    if last_message_at is not None:
+        elapsed = int(datetime.now().timestamp() - last_message_at)
+        if elapsed < 60:
+            time_since_last_message = f"{elapsed}s"
+        elif elapsed < 3600:
+            time_since_last_message = f"{elapsed // 60}m"
+        else:
+            time_since_last_message = f"{elapsed // 3600}h {(elapsed % 3600) // 60}m"
+
     return {
         "system":         platform_module.system(),
         "date":           now.strftime("%Y-%m-%d"),
@@ -124,6 +138,7 @@ def _build_variables(agent, ctx=None, trusted_threshold: int = 90) -> dict:
         "trusted":        trusted,
         "server_name":    session.get("server_name") or "",
         "channel_name":   session.get("channel_name") or "",
+        "time_since_last_message": time_since_last_message,
     }
 
 
@@ -229,6 +244,24 @@ def register_agent(agent) -> None:
         autoescape=False,
     )
 
+    # Stash for the async hook to write into, footer provider reads from.
+    _last_message_ts: list[float | None] = [None]
+
+    async def _fetch_last_message_time(ctx) -> None:
+        """Pre-assemble hook: find created_at of the most recent prior user node."""
+        try:
+            ancestors = agent.db.get_ancestors(ctx.tail_node_id)
+            # Walk tip→root looking for a user node that isn't the current tip.
+            for node in reversed(ancestors[:-1]):
+                if node.role == "user":
+                    _last_message_ts[0] = node.created_at
+                    return
+        except Exception as exc:
+            logger.debug("[equipment_manifest] last_message_at lookup failed: %s", exc)
+        _last_message_ts[0] = None
+
+    agent.context.register_hook(HOOK_PRE_ASSEMBLE_ASYNC, _fetch_last_message_time)
+
     # ------------------------------------------------------------------
     # Static top — system role, cache-stable
     # ------------------------------------------------------------------
@@ -277,7 +310,7 @@ def register_agent(agent) -> None:
     _builtin_footer_tmpl = jinja_env.from_string(_DEFAULT_FOOTER_TEMPLATE)
 
     def _em_prompt_footer(ctx) -> str | None:
-        variables = _build_variables(agent, ctx, trusted_threshold)
+        variables = _build_variables(agent, ctx, trusted_threshold, _last_message_ts[0])
 
         if has_footer_file:
             try:
