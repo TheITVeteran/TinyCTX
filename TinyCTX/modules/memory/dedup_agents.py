@@ -116,21 +116,34 @@ async def _aset(conn, uid: str, field: str, value):
 
 
 # ---------------------------------------------------------------------------
-# Connected-component grouping + batch-size-aware partitioning
+# Pivot-based partitioning (Ailon-Charikar-Newman correlation clustering)
 # ---------------------------------------------------------------------------
 
-def _build_and_partition(
+def _pivot_partition(
     candidates: list[tuple[dict, dict, float]],
     batch_size: int,
 ) -> list[list[dict]]:
     """
-    Build connected components from candidate pairs, then partition any component
-    larger than batch_size into groups using greedy degree-aware packing.
+    Partition candidate nodes into groups using the Pivot algorithm, a
+    3-approximation for correlation clustering (Ailon, Charikar, Newman 2008).
 
-    Every candidate edge's two endpoints are guaranteed to land in the same group,
-    unless the component is so dense that splitting is unavoidable — in that case
-    high-degree nodes (hubs) are packed together first to preserve the most edges.
+    Every node in a group has a direct candidate edge to the pivot that anchored
+    it — unlike connected-component grouping, there are no transitively-included
+    bystanders.  This keeps LLM batches semantically tight.
+
+    Algorithm:
+      1. Shuffle nodes (randomised pivot gives the approximation guarantee).
+      2. Pick the first unprocessed node as pivot.
+      3. Cluster = pivot + all its unprocessed direct neighbours.
+      4. Emit the cluster (splitting into batch_size chunks if needed).
+      5. Remove all emitted nodes and repeat.
+
+    Splitting an oversized cluster is safe because the cluster is already dense
+    (every node has a direct edge to the pivot), so any contiguous slice still
+    contains high-quality candidate pairs.
     """
+    import random
+
     by_uuid: dict[str, dict] = {}
     adjacency: dict[str, set[str]] = defaultdict(set)
 
@@ -141,52 +154,25 @@ def _build_and_partition(
         adjacency[uid_a].add(uid_b)
         adjacency[uid_b].add(uid_a)
 
-    # BFS to find connected components
-    visited: set[str] = set()
-    raw_components: list[list[str]] = []
+    order = list(by_uuid.keys())
+    random.shuffle(order)
 
-    for start_uid in by_uuid:
-        if start_uid in visited:
-            continue
-        component_uids: list[str] = []
-        queue = [start_uid]
-        while queue:
-            uid = queue.pop()
-            if uid in visited:
-                continue
-            visited.add(uid)
-            component_uids.append(uid)
-            queue.extend(adjacency[uid] - visited)
-        raw_components.append(component_uids)
-
-    # Partition each component if it exceeds batch_size
+    processed: set[str] = set()
     result: list[list[dict]] = []
-    for component_uids in raw_components:
-        if len(component_uids) <= batch_size:
-            result.append([by_uuid[u] for u in component_uids])
+
+    for pivot in order:
+        if pivot in processed:
             continue
-
-        # Greedy degree-descending packing: high-degree nodes anchor groups,
-        # each new node joins the first group it shares an edge with that still
-        # has room, otherwise starts a new group.
-        sorted_uids = sorted(
-            component_uids,
-            key=lambda u: len(adjacency.get(u, set())),
-            reverse=True,
-        )
-        groups: list[list[str]] = []
-        for uid in sorted_uids:
-            placed = False
-            neighbors = adjacency.get(uid, set())
-            for group in groups:
-                if len(group) < batch_size and neighbors & set(group):
-                    group.append(uid)
-                    placed = True
-                    break
-            if not placed:
-                groups.append([uid])
-
-        result.extend([by_uuid[u] for u in g] for g in groups)
+        # Cluster: pivot + unprocessed direct neighbours, pivot first
+        cluster = [pivot] + [
+            u for u in adjacency[pivot] if u not in processed and u != pivot
+        ]
+        processed.update(cluster)
+        # Split into batch_size chunks; every chunk contains the pivot (first
+        # element) only in the first chunk, but remaining chunks are still
+        # dense because all their members are direct neighbours of the pivot.
+        for i in range(0, len(cluster), batch_size):
+            result.append([by_uuid[u] for u in cluster[i:i + batch_size]])
 
     return result
 
@@ -432,8 +418,8 @@ async def run_dedup_cycle(
             logger.info("[memory/librarian] dedup: all candidates already resolved")
             return
 
-        # Cluster into connected components, partition to batch_size, evaluate each group
-        components = _build_and_partition(filtered, batch_size)
+        # Partition into pivot-anchored groups, evaluate each with one LLM call
+        components = _pivot_partition(filtered, batch_size)
         logger.info(
             "[memory/librarian] dedup: %d candidate(s) → %d group(s) (batch_size=%d)",
             len(filtered), len(components), batch_size,
