@@ -331,10 +331,10 @@ def build_content_blocks(
                     " â€” model does not support vision, use filesystem tools to inspect]"
                 )
                 continue
-            # Inline as image_url block
+            # Inline as image_url block — convert non-standard formats to JPEG
             img_data = att.data
             mime = att.mime_type.split(";")[0].strip()
-            if mime == "image/webp":
+            if mime not in ("image/jpeg", "image/png"):
                 converted = _convert_to_jpeg(img_data)
                 if converted is not None:
                     img_data = converted
@@ -342,7 +342,7 @@ def build_content_blocks(
                 else:
                     ref_notes.append(
                         f"[Image uploaded to {saved_path}: {att.filename}"
-                        " — webp not supported by model and Pillow unavailable for conversion]"
+                        " — unsupported image format and Pillow unavailable for conversion]"
                     )
                     continue
             b64 = base64.b64encode(img_data).decode()
