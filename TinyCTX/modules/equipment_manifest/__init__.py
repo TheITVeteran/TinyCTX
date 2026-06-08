@@ -22,9 +22,8 @@ EXTENSION_META = {
         "enabled": True,
         # System prompt priority (lower = earlier in the prompt).
         "prompt_priority": 5,
-        # Trusted users: list of "platform:user_id" strings.
-        # Trusted users in DMs skip the anti-jailbreak injections in the EM footer.
-        # Example: ["discord:845336457153740830", "matrix:@you:matrix.org"]
-        "trusted_users": [],
+        # trusted template variable is True when the requesting user has
+        # permission_level >= trusted_threshold in the UserStore (DM only, never in group chats).
+        "trusted_threshold": 90,
     },
 }

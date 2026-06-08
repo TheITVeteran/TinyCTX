@@ -38,9 +38,8 @@ Available template variables (both templates):
   is_dm           — Opposite of is_group_chat. True for 1:1 DM lanes.
   platform        — Bridge platform string: "discord", "matrix", "cli",
                     "api", "cron", or "" for synthetic/unknown turns.
-  trusted         — True when the current user is in the trusted_users list
-                    in equipment_manifest config (format: "platform:user_id").
-                    Always False for group chats — trust is DM-only.
+  trusted         — True when the current user has permission_level >= trusted_threshold
+                    in the UserStore. True in both DMs and group chats.
                     Read from ctx.state["author_id"] + ctx.state["platform"].
 
 NOTE: For best cache efficiency, avoid using {{ time }} or {{ date }} inside
@@ -71,6 +70,9 @@ from jinja2 import Environment, FileSystemLoader, TemplateNotFound, TemplateSynt
 
 logger = logging.getLogger(__name__)
 
+# Module-level reference set by register_runtime.
+_users = None
+
 _FOOTER_FILENAME = "EM_FOOTER.md"
 
 # Built-in footer used when no EM_FOOTER.md exists.
@@ -82,7 +84,7 @@ _DEFAULT_FOOTER_TEMPLATE = "<clock>{{ time }}</clock>"
 # Variable builder
 # ---------------------------------------------------------------------------
 
-def _build_variables(agent, ctx=None, trusted_users: frozenset = frozenset()) -> dict:
+def _build_variables(agent, ctx=None, trusted_threshold: int = 90) -> dict:
     now         = datetime.now()
     workspace   = Path(agent.config.workspace.path).expanduser().resolve()
     source_root = Path.cwd().resolve()
@@ -99,13 +101,15 @@ def _build_variables(agent, ctx=None, trusted_users: frozenset = frozenset()) ->
     is_group_chat = bool(session.get("server_name"))
     platform = session.get("platform") or ""
     author_id = session.get("author_id") or ""
-    # Trust is only meaningful in DMs — never grant it in group chats.
-    trusted = (
-        not is_group_chat
-        and bool(platform)
-        and bool(author_id)
-        and f"{platform}:{author_id}" in trusted_users
-    )
+    # Trust check — applies in both DMs and group chats.
+    trusted = False
+    if _users is not None and platform and author_id:
+        try:
+            from TinyCTX.contracts import Platform
+            user = _users.get_by_platform_id(Platform(platform), author_id)
+            trusted = user is not None and user.permission_level >= trusted_threshold
+        except Exception as exc:
+            logger.debug("[equipment_manifest] trusted lookup failed: %s", exc)
 
     return {
         "system":         platform_module.system(),
@@ -123,7 +127,7 @@ def _build_variables(agent, ctx=None, trusted_users: frozenset = frozenset()) ->
     }
 
 
-def _build_static_variables(agent, ctx=None, trusted_users: frozenset = frozenset()) -> dict:
+def _build_static_variables(agent, ctx=None, trusted_threshold: int = 90) -> dict:
     """Like _build_variables but omits `time` so the result is cache-stable."""
     workspace   = Path(agent.config.workspace.path).expanduser().resolve()
     source_root = Path.cwd().resolve()
@@ -141,12 +145,14 @@ def _build_static_variables(agent, ctx=None, trusted_users: frozenset = frozense
     is_group_chat = bool(session.get("server_name"))
     platform = session.get("platform") or ""
     author_id = session.get("author_id") or ""
-    trusted = (
-        not is_group_chat
-        and bool(platform)
-        and bool(author_id)
-        and f"{platform}:{author_id}" in trusted_users
-    )
+    trusted = False
+    if _users is not None and platform and author_id:
+        try:
+            from TinyCTX.contracts import Platform
+            user = _users.get_by_platform_id(Platform(platform), author_id)
+            trusted = user is not None and user.permission_level >= trusted_threshold
+        except Exception as exc:
+            logger.debug("[equipment_manifest] trusted lookup failed: %s", exc)
 
     return {
         "system":         platform_module.system(),
@@ -180,6 +186,12 @@ def _resolve_em_path(em_path_cfg: str, module_dir: Path, workspace: Path) -> Pat
 # register()
 # ---------------------------------------------------------------------------
 
+def register_runtime(runtime) -> None:
+    global _users
+    _users = runtime.users
+    logger.info("[equipment_manifest] registered — UserStore at %s", id(_users))
+
+
 def register_agent(agent) -> None:
     # Normalise: accept an AgentCycle
     # Wrap Runtime in a minimal shim so the rest of register() is unchanged.
@@ -203,9 +215,7 @@ def register_agent(agent) -> None:
     module_dir = Path(__file__).parent.resolve()
     em_path    = _resolve_em_path(str(cfg.get("em_path", "")), module_dir, workspace)
     priority   = int(cfg.get("prompt_priority", 5))
-    trusted_users = frozenset(
-        str(u) for u in cfg.get("trusted_users", []) if u
-    )
+    trusted_threshold = int(cfg.get("trusted_threshold", 90))
 
     if not em_path.exists():
         logger.debug("[equipment_manifest] EM.md not found at %s — module inactive", em_path)
@@ -232,7 +242,7 @@ def register_agent(agent) -> None:
             logger.warning("[equipment_manifest] syntax error in %s: %s", em_path, exc)
             return None
 
-        variables = _build_static_variables(agent, ctx, trusted_users)
+        variables = _build_static_variables(agent, ctx, trusted_threshold)
         try:
             rendered = template.render(**variables).strip()
         except Exception as exc:
@@ -267,7 +277,7 @@ def register_agent(agent) -> None:
     _builtin_footer_tmpl = jinja_env.from_string(_DEFAULT_FOOTER_TEMPLATE)
 
     def _em_prompt_footer(ctx) -> str | None:
-        variables = _build_variables(agent, ctx, trusted_users)
+        variables = _build_variables(agent, ctx, trusted_threshold)
 
         if has_footer_file:
             try:
