@@ -376,7 +376,7 @@ def build_content_blocks(
                 if extracted is None:
                     ref_notes.append(
                         f"[PDF uploaded to {saved_path}: {att.filename}"
-                        "  --" install pdfplumber to extract text, or use filesystem tools]"
+                        "  -- pip install pdfplumber to extract text, or use filesystem tools]"
                     )
                     continue
             elif ext == ".docx":
@@ -384,7 +384,7 @@ def build_content_blocks(
                 if extracted is None:
                     ref_notes.append(
                         f"[DOCX uploaded to {saved_path}: {att.filename}"
-                        "  --" install python-docx to extract text, or use filesystem tools]"
+                        "  -- pip install python-docx to extract text, or use filesystem tools]"
                     )
                     continue
 
