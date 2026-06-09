@@ -1,5 +1,5 @@
 """
-utils/attachments.py â€" Attachment classification, saving, and LLM content-block assembly.
+utils/attachments.py  --" Attachment classification, saving, and LLM content-block assembly.
 
 This is a pure utility module (not an agent module).  It has no tools, hooks, or
 prompts.  Bridges and the gateway call it directly.
@@ -21,14 +21,14 @@ application/pdf              â†' {"type": "text", "text": "<extracted or stub
 binary / unknown             â†' reference note in text, saved to uploads/
 
 The inline-vs-reference decision respects AttachmentConfig thresholds:
-  inline_max_files â€" max number of files to inline per message (default 3)
-  inline_max_bytes â€" max total raw bytes to inline (default ~200 KB)
+  inline_max_files  --" max number of files to inline per message (default 3)
+  inline_max_bytes  --" max total raw bytes to inline (default ~200 KB)
 Once either threshold is hit, remaining files are reference-only regardless of kind.
 
 Soft dependencies
 -----------------
-pdfplumber  â€" PDF text extraction.  If absent, PDFs get a stub reference note.
-python-docx â€" DOCX text extraction. If absent, DOCX files get a stub reference note.
+pdfplumber   --" PDF text extraction.  If absent, PDFs get a stub reference note.
+python-docx  --" DOCX text extraction. If absent, DOCX files get a stub reference note.
 Neither is required; attachments.py degrades gracefully.
 """
 
@@ -91,7 +91,7 @@ _IMAGE_MIMES: frozenset[str] = frozenset({
 def classify(attachment: Attachment) -> AttachmentKind:
     """
     Derive the AttachmentKind for an Attachment from its mime_type and filename.
-    The returned kind is not stored back onto the (frozen) dataclass â€" callers
+    The returned kind is not stored back onto the (frozen) dataclass  --" callers
     use the return value directly.
     """
     mime  = (attachment.mime_type or "").lower().split(";")[0].strip()
@@ -181,13 +181,13 @@ def save_upload(attachment: Attachment, uploads_dir: Path) -> Path:
     content_hash = hashlib.sha256(attachment.data).hexdigest()
     cache = _load_cache(uploads_dir)
 
-    # Cache hit â€" same bytes already stored.
+    # Cache hit  --" same bytes already stored.
     if content_hash in cache:
         existing = uploads_dir / cache[content_hash]
         if existing.exists():
             logger.debug("Dedup: reusing existing upload %s", existing.name)
             return existing
-        # Stale entry (file was deleted) â€" fall through and re-save.
+        # Stale entry (file was deleted)  --" fall through and re-save.
         logger.debug("Upload cache stale for %s, re-saving", safe_name)
 
     # Determine destination, avoiding name collisions with different-content files.
@@ -328,10 +328,10 @@ def build_content_blocks(
             if not model_cfg.supports_vision:
                 ref_notes.append(
                     f"[Image uploaded to {saved_path}: {att.filename}"
-                    " â€" model does not support vision, use filesystem tools to inspect]"
+                    "  --" model does not support vision, use filesystem tools to inspect]"
                 )
                 continue
-            # Inline as image_url block — always convert to PNG for broad API compatibility
+            # Inline as image_url block -- always convert to PNG for broad API compatibility
             img_data = att.data
             mime = att.mime_type.split(";")[0].strip()
             if mime != "image/png":
@@ -342,7 +342,7 @@ def build_content_blocks(
                 else:
                     ref_notes.append(
                         f"[Image uploaded to {saved_path}: {att.filename}"
-                        " — unsupported image format and Pillow unavailable for conversion]"
+                        " -- unsupported image format and Pillow unavailable for conversion]"
                     )
                     continue
             b64 = base64.b64encode(img_data).decode()
@@ -376,7 +376,7 @@ def build_content_blocks(
                 if extracted is None:
                     ref_notes.append(
                         f"[PDF uploaded to {saved_path}: {att.filename}"
-                        " â€" install pdfplumber to extract text, or use filesystem tools]"
+                        "  --" install pdfplumber to extract text, or use filesystem tools]"
                     )
                     continue
             elif ext == ".docx":
@@ -384,7 +384,7 @@ def build_content_blocks(
                 if extracted is None:
                     ref_notes.append(
                         f"[DOCX uploaded to {saved_path}: {att.filename}"
-                        " â€" install python-docx to extract text, or use filesystem tools]"
+                        "  --" install python-docx to extract text, or use filesystem tools]"
                     )
                     continue
 
@@ -407,7 +407,7 @@ def build_content_blocks(
         full_text = (text + "\n\n" + "\n".join(ref_notes)).strip()
 
     if not blocks:
-        # All reference â€" return plain string, no content block list needed
+        # All reference  --" return plain string, no content block list needed
         return full_text
 
     # Mix: text block first, then attachment blocks
