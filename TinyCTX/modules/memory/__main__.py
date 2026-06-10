@@ -74,6 +74,10 @@ _token_budget:   int = 4096
 _pinned_user_scan: int = 3
 _graph_embedder: object | None = None  # embedder for dedup; falls back to search embedder
 
+# Cache for the pinned-entity memory block. Built in a thread via
+# _refresh_memory_block() so the prompt provider never blocks the event loop.
+_memory_block_cache: dict[str, str | None] = {"value": None}
+
 
 # ---------------------------------------------------------------------------
 # _YieldingLLM — pauses background LLM calls while user cycles are active
@@ -777,13 +781,34 @@ def register_agent(cycle) -> None:
         body = "\n\n".join(sections)
         return f"<memory>\n{body}\n</memory>"
 
+    # Async helper: build the memory block in a thread and cache the result.
+    async def _refresh_memory_block(dialogue_snapshot: list) -> None:
+        loop = asyncio.get_running_loop()
+        active_users = _active_users_from_dialogue(dialogue_snapshot, _pinned_user_scan)
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: _build_memory_block(_graph_db, _token_budget, active_users),
+            )
+            _memory_block_cache["value"] = result
+        except Exception:
+            logger.exception("[memory] _refresh_memory_block failed")
+
+    # Kick off an initial refresh so the cache is warm before the first turn.
+    asyncio.get_event_loop().create_task(
+        _refresh_memory_block(list(cycle.context.dialogue))
+    )
+
+    # Add a post_turn_hook that refreshes the cache after each turn.
+    # Runs after pressure ingest hook so it picks up the latest dialogue.
+    async def _memory_cache_refresh_hook(final_tail: str) -> None:
+        await _refresh_memory_block(list(cycle.context.dialogue))
+
+    cycle.post_turn_hooks.append(_memory_cache_refresh_hook)
+
     cycle.context.register_prompt(
         "memory_pinned",
-        lambda _ctx: _build_memory_block(
-            _graph_db,
-            _token_budget,
-            _active_users_from_dialogue(_ctx.dialogue, _pinned_user_scan),
-        ),
+        lambda _ctx: _memory_block_cache["value"],
         role="system",
         priority=_pinned_prio,
     )
