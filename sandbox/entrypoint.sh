@@ -25,8 +25,10 @@ iptables -A OUTPUT -d 198.51.100.0/24    -j DROP  # TEST-NET-2
 iptables -A OUTPUT -d 203.0.113.0/24     -j DROP  # TEST-NET-3
 iptables -A OUTPUT -d 240.0.0.0/4        -j DROP  # reserved
 iptables -A OUTPUT -d 255.255.255.255/32 -j DROP  # broadcast
-# IPv6 equivalents (ip6tables)
-ip6tables -A OUTPUT -d ::1/128           -j DROP  # loopback (also covered by -o lo ACCEPT above, belt+suspenders)
+# IPv6 — block private/reserved ranges via ip6tables (installed with the iptables package on Debian).
+ip6tables -A OUTPUT -o lo                                        -j ACCEPT
+ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED   -j ACCEPT
+ip6tables -A OUTPUT -d ::1/128           -j DROP  # loopback
 ip6tables -A OUTPUT -d ::ffff:0:0/96     -j DROP  # IPv4-mapped
 ip6tables -A OUTPUT -d 64:ff9b::/96      -j DROP  # NAT64 well-known prefix
 ip6tables -A OUTPUT -d 100::/64          -j DROP  # discard-only
