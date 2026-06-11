@@ -732,6 +732,18 @@ class GraphDB:
             "top_mentioned":          top_mentioned,
         }
 
+    def all_entities_for_bm25(self) -> list[tuple[str, str]]:
+        """Return [(uuid, text)] for BM25 indexing — name + description concatenated."""
+        r = self.safe_execute(
+            "MATCH (e:Entity) RETURN e.uuid, e.name, e.entity_type, e.description"
+        )
+        results = []
+        while r.has_next():
+            row = r.get_next()
+            uid, name, etype, desc = row[0], row[1] or "", row[2] or "", row[3] or ""
+            results.append((uid, f"{name} {etype} {desc}"))
+        return results
+
     def all_entities_with_embeddings(self) -> list[tuple[str, list[float]]]:
         """Return [(uuid, embedding)] for all entities that have embeddings."""
         r = self.safe_execute(

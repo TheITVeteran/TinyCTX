@@ -36,6 +36,7 @@ from TinyCTX.contracts import (
     Attachment,
     content_type_for,
     InboundMessage,
+    SessionEnvironment,
     Platform,
 )
 
@@ -264,6 +265,16 @@ class DiscordBridge:
     def _dehumanize_mentions(self, text: str) -> str:
         return dehumanize_mentions(text, self._runtime)
 
+    def _bot_display_name(self, guild: discord.Guild | None = None) -> str | None:
+        """Return the bot's display name in the given guild, or globally if no guild."""
+        if self._client.user is None:
+            return None
+        if guild is not None:
+            member = guild.get_member(self._client.user.id)
+            if member is not None:
+                return member.display_name
+        return self._client.user.display_name
+
     # ------------------------------------------------------------------
     # Attachment / forwarded-message helpers
     # ------------------------------------------------------------------
@@ -482,13 +493,15 @@ class DiscordBridge:
             msg = InboundMessage(
                 tail_node_id="",
                 author=author,
+                env=SessionEnvironment(
+                    platform=Platform.DISCORD,
+                    agent_name=self._bot_display_name(),
+                ),
                 content_type=content_type_for(text, bool(attachments)),
                 text=text,
                 message_id=str(message.id),
                 timestamp=time.time(),
                 attachments=attachments,
-                server_name=None,
-                channel_name=None,
                 trigger=True,
                 reply_to_author=reply_to_author_dm,
             )
@@ -559,13 +572,17 @@ class DiscordBridge:
         msg = InboundMessage(
             tail_node_id="",
             author=author,
+            env=SessionEnvironment(
+                platform=Platform.DISCORD,
+                agent_name=self._bot_display_name(message.guild),
+                server_name=message.guild.name if message.guild else None,
+                channel_name=getattr(message.channel, "name", None),
+            ),
             content_type=content_type_for(text, bool(attachments)),
             text=text,
             message_id=str(message.id),
             timestamp=time.time(),
             attachments=attachments,
-            server_name=message.guild.name if message.guild else None,
-            channel_name=getattr(message.channel, "name", None),
             trigger=is_trigger,
             reply_to_author=reply_to_author_group,
         )
@@ -687,13 +704,17 @@ class DiscordBridge:
         msg = InboundMessage(
             tail_node_id="",
             author=author,
+            env=SessionEnvironment(
+                platform=Platform.DISCORD,
+                agent_name=self._bot_display_name(message.guild),
+                server_name=message.guild.name if message.guild else None,
+                channel_name=getattr(thread, "name", None),
+            ),
             content_type=content_type_for(text, bool(attachments)),
             text=text,
             message_id=str(message.id),
             timestamp=time.time(),
             attachments=attachments,
-            server_name=message.guild.name if message.guild else None,
-            channel_name=getattr(thread, "name", None),
             trigger=True,
             reply_to_author=reply_to_author_thread,
         )

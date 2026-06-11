@@ -20,6 +20,7 @@ _graph_db:       Any = None
 _embedder:       Any = None
 _query_template: str = "{text}"
 _doc_template:   str = "{text}"
+_bm25_weight:    float = 0.4
 
 
 def init(
@@ -30,14 +31,16 @@ def init(
     *,
     query_template: str = "{text}",
     doc_template: str = "{text}",
+    bm25_weight: float = 0.4,
 ):
-    global _conn, _write_lock, _graph_db, _embedder, _query_template, _doc_template
+    global _conn, _write_lock, _graph_db, _embedder, _query_template, _doc_template, _bm25_weight
     _conn             = conn
     _write_lock       = write_lock
     _graph_db         = graph_db
     _embedder         = embedder
     _query_template   = query_template
     _doc_template     = doc_template
+    _bm25_weight      = max(0.0, min(1.0, bm25_weight))
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +164,7 @@ async def kg_update_entity(
         pinned_target: TinyCTX username to target. Only used when pinned="user".
     """
     if description is None and priority is None and pinned is None:
-        return f"No fields to update — nothing changed for UUID {uuid}."
+        return f"Warning: kg_update_entity called with no fields — nothing changed for UUID {uuid}. You must provide at least one of: description, priority, pinned."
 
     entity = _graph_db.get_entity(uuid)
     if not entity:
@@ -196,7 +199,7 @@ async def kg_update_entity(
             lines.append(f"  Description was: {old_desc}")
             lines.append(f"  Description now: {description}")
         else:
-            lines.append("  Description: unchanged")
+            lines.append("  Warning: description passed to kg_update_entity is identical to the existing description — no change made. Write a genuinely updated description.")
     if priority is not None:
         lines.append(f"  Priority: {old_pri} → {priority}")
     if pinned is not None:
@@ -308,9 +311,10 @@ async def kg_delete_relationship(src_uuid: str, tgt_uuid: str, relation: str) ->
     return f"Deleted relationship: '{src_name}' -[{rel}]-> '{tgt_name}'."
 
 
-async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
+async def kg_search(query: str, top_k: int = 3, semantic: bool = True) -> str:
     """
     Search the knowledge graph for entities relevant to a query.
+    Uses hybrid BM25 + vector search fused with Reciprocal Rank Fusion (RRF).
     Returns matching entities with their direct active relationships.
     Bumps mention_count on returned nodes.
 
@@ -319,31 +323,60 @@ async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
 
     Args:
         query: Natural language query or keywords to search for.
-        top_k: Maximum number of entities to return (default 5).
-        semantic: If true (default), use vector similarity search.
-            If false or no embedding model configured, uses keyword search.
+        top_k: Maximum number of entities to return (default 3).
+        semantic: If true (default), include vector similarity search in fusion.
+            If false or no embedding model configured, uses BM25 only.
     """
-    # Check for an exact name match — pin it to the top but continue searching.
+    from TinyCTX.utils.bm25 import BM25
+
+    RRF_K = 60  # standard RRF constant
+
+    # --- Exact name match (always pinned to top) ---
     exact_matches = _graph_db.find_entity(name=query)
     exact = next((e for e in exact_matches if e["name"].lower() == query.lower()), None)
     exact_uid = exact["uuid"] if exact else None
 
-    query_vec = None
+    # --- BM25 ---
+    bm25_corpus = _graph_db.all_entities_for_bm25()
+    bm25_scores: dict[str, int] = {}  # uid -> rank (1-based)
+    if bm25_corpus:
+        corpus_dict = {uid: text for uid, text in bm25_corpus}
+        bm25 = BM25(corpus_dict)
+        bm25_hits = bm25.search(query, top_k=len(corpus_dict))
+        for rank, (uid, score) in enumerate(bm25_hits, start=1):
+            if score > 0:
+                bm25_scores[uid] = rank
+
+    # --- Vector ---
+    vec_scores: dict[str, int] = {}  # uid -> rank (1-based)
     if semantic and _embedder is not None:
         try:
             query_vec = await _embedder.embed_one(_query_template.format(text=query))
+            all_embs  = _graph_db.all_entities_with_embeddings()
+            vec_hits  = top_k_cosine(query_vec, all_embs, len(all_embs))
+            for rank, (uid, score) in enumerate(vec_hits, start=1):
+                vec_scores[uid] = rank
         except Exception as exc:
-            logger.warning("[memory] kg_search embed failed: %s -- falling back to keyword", exc)
+            logger.warning("[memory] kg_search embed failed: %s -- BM25 only", exc)
 
-    if query_vec is not None:
-        all_embs = _graph_db.all_entities_with_embeddings()
-        uids     = [uid for uid, _ in top_k_cosine(query_vec, all_embs, top_k)]
-    else:
-        uids = [r["uuid"] for r in _graph_db.find_entity(name=query)[:top_k]]
+    # --- RRF fusion ---
+    vec_weight = 1.0 - _bm25_weight
+    all_uids = set(bm25_scores) | set(vec_scores)
+    rrf: dict[str, float] = {}
+    for uid in all_uids:
+        score = 0.0
+        if uid in bm25_scores:
+            score += _bm25_weight / (RRF_K + bm25_scores[uid])
+        if uid in vec_scores:
+            score += vec_weight / (RRF_K + vec_scores[uid])
+        rrf[uid] = score
 
-    # Prepend exact match (if any) and deduplicate, preserving order.
+    ranked = sorted(rrf, key=lambda u: rrf[u], reverse=True)
+
+    # Prepend exact match, deduplicate, cap at top_k
     if exact_uid:
-        uids = [exact_uid] + [u for u in uids if u != exact_uid]
+        ranked = [exact_uid] + [u for u in ranked if u != exact_uid]
+    uids = ranked[:top_k]
 
     if not uids:
         return "No matching entities found."
@@ -360,7 +393,7 @@ async def kg_search(query: str, top_k: int = 5, semantic: bool = True) -> str:
         desc  = entity.get("e.description", "")
         pri   = entity.get("e.priority", "?")
         pin   = entity.get("e.pinned_target")
-        pin_note = f"  [pinned:{pin}]" if pin else ""
+        pin_note   = f"  [pinned:{pin}]" if pin else ""
         exact_note = "  [exact match]" if uid == exact_uid else ""
         lines.append(f"[{etype}] {name} (UUID: {uid}){pin_note}  priority: {pri}{exact_note}")
         if desc:
@@ -499,6 +532,108 @@ async def kg_list(entity_type: str = "", pinned_only: bool = False) -> str:
         )
     return "\n\n".join(lines)
 
+
+def _resolve_entity(uuid_or_name: str) -> dict | None:
+    """Return entity_slim dict by UUID or exact name, or None if not found."""
+    e = _graph_db.get_entity_slim(uuid_or_name)
+    if e:
+        return e
+    matches = _graph_db.find_entity(name=uuid_or_name)
+    exact = next((m for m in matches if m["name"].lower() == uuid_or_name.lower()), None)
+    return exact  # already a slim dict (uuid, name, entity_type)
+
+
+async def kg_merge_entities(
+    canonical: str,
+    duplicate: str,
+    merged_description: str,
+    verdict: str = "duplicate",
+) -> str:
+    """
+    Merge two knowledge graph entities.
+
+    Use when you identify that two nodes refer to the same real-world thing.
+    All edges from the duplicate are re-pointed to the canonical node, then
+    the duplicate is deleted (verdict="duplicate") or linked via ALIASED_TO
+    (verdict="alias").
+
+    Args:
+        canonical: UUID or exact name of the node to keep as the authoritative entity.
+        duplicate: UUID or exact name of the node to absorb or alias.
+        merged_description: Consolidated description combining facts from both nodes.
+        verdict: "duplicate" (delete the dup, reparent its edges) or
+                 "alias" (keep both, add ALIASED_TO edge from dup to canonical).
+    """
+    if verdict not in ("duplicate", "alias"):
+        return f"Error: verdict must be 'duplicate' or 'alias', got '{verdict}'."
+
+    canon_e = _resolve_entity(canonical)
+    dup_e   = _resolve_entity(duplicate)
+    if not canon_e:
+        return f"Error: canonical entity '{canonical}' not found."
+    if not dup_e:
+        return f"Error: duplicate entity '{duplicate}' not found."
+
+    canonical_uuid = canon_e["uuid"]
+    duplicate_uuid = dup_e["uuid"]
+
+    if canonical_uuid == duplicate_uuid:
+        return "Error: canonical and duplicate resolve to the same entity."
+
+    canon_name = canon_e["name"]
+    dup_name   = dup_e["name"]
+    now        = now_ts()
+
+    async with _write_lock:
+        if verdict == "duplicate":
+            await _aset(canonical_uuid, "description", merged_description)
+            await _aset(canonical_uuid, "updated_at",  now)
+            await _aset(canonical_uuid, "embed_hash",  "")
+            # Re-point outgoing edges from dup to canon
+            await _conn.execute(
+                "MATCH (dup:Entity)-[r:Relation]->(x:Entity), (c:Entity) "
+                "WHERE dup.uuid = $dup AND r.superseded_at IS NULL "
+                "AND x.uuid <> $canon AND c.uuid = $canon "
+                "CREATE (c)-[:Relation {relation: r.relation, weight: r.weight, "
+                "description: r.description, created_at: r.created_at, superseded_at: null}]->(x)",
+                parameters={"dup": duplicate_uuid, "canon": canonical_uuid},
+            )
+            # Re-point incoming edges to dup over to canon
+            await _conn.execute(
+                "MATCH (x:Entity)-[r:Relation]->(dup:Entity), (c:Entity) "
+                "WHERE dup.uuid = $dup AND r.superseded_at IS NULL "
+                "AND x.uuid <> $canon AND c.uuid = $canon "
+                "CREATE (x)-[:Relation {relation: r.relation, weight: r.weight, "
+                "description: r.description, created_at: r.created_at, superseded_at: null}]->(c)",
+                parameters={"dup": duplicate_uuid, "canon": canonical_uuid},
+            )
+            await _conn.execute(
+                "MATCH (e:Entity) WHERE e.uuid = $uid DETACH DELETE e",
+                parameters={"uid": duplicate_uuid},
+            )
+            return (
+                f"Merged '{dup_name}' ({duplicate_uuid}) into '{canon_name}' ({canonical_uuid}).\n"
+                f"  Edges reparented and duplicate deleted.\n"
+                f"  Description: {merged_description}"
+            )
+        else:  # alias
+            await _aset(duplicate_uuid, "description", f"This node is aliased to {canon_name}. The UUID for that node is {canonical_uuid}.")
+            await _aset(duplicate_uuid, "updated_at",  now)
+            await _aset(canonical_uuid, "description", merged_description)
+            await _aset(canonical_uuid, "updated_at",  now)
+            await _aset(canonical_uuid, "embed_hash",  "")
+            await _conn.execute(
+                f"MATCH (a:Entity), (c:Entity) "
+                f"WHERE a.uuid = $alias AND c.uuid = $canon "
+                f"CREATE (a)-[:Relation {{relation: 'ALIASED_TO', weight: 1.0, "
+                f"description: 'alias', created_at: {now!r}, superseded_at: null}}]->(c)",
+                parameters={"alias": duplicate_uuid, "canon": canonical_uuid},
+            )
+            return (
+                f"Aliased '{dup_name}' ({duplicate_uuid}) -> '{canon_name}' ({canonical_uuid}).\n"
+                f"  Canonical description updated: {merged_description}\n"
+                f"  Alias node description set to redirect stub."
+            )
 
 async def kg_stats() -> str:
     """

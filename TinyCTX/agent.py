@@ -106,6 +106,7 @@ class AgentCycle:
         max_cycles = self.config.max_tool_cycles
         final_text = ""
         streaming_active = False
+        agent_name: str | None = state.get("agent_name")
 
         for cycle_num in range(max_cycles):
             logger.debug("[agent] cycle %d, node %s", cycle_num + 1, node_id)
@@ -147,6 +148,7 @@ class AgentCycle:
             self.context.add(HistoryEntry.assistant(
                 content=response_text,
                 tool_calls=tool_calls_list or None,
+                author_id=agent_name,
             ))
             meta["tail_node_id"] = self.context.tail_node_id
             logger.debug("[agent] assistant node written, tail=%s", self.context.tail_node_id)

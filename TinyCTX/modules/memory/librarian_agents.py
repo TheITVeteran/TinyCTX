@@ -96,12 +96,14 @@ def _make_tool_handler():
 
     handler = ToolCallHandler()
     for fn in [
+        tools.kg_search,
         tools.kg_add_entity,
         tools.kg_update_entity,
+        tools.kg_merge_entities,
         tools.kg_add_relationship,
         tools.kg_delete_entity,
         tools.kg_delete_relationship,
-        tools.kg_get_entity
+        tools.kg_get_entity,
     ]:
         handler.register_tool(fn, always_on=True, min_permission=0)
     return handler
