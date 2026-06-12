@@ -171,7 +171,14 @@ class ToolCallHandler:
                 ann = non_none[0] if len(non_none) == 1 else ann
             if ann in (int, float, bool, str) and not isinstance(value, ann):
                 try:
-                    coerced[key] = ann(value)
+                    if ann is bool:
+                        # bool("false") == True in Python — handle string literals explicitly
+                        if isinstance(value, str):
+                            coerced[key] = value.strip().lower() not in ("false", "0", "no", "")
+                        else:
+                            coerced[key] = bool(value)
+                    else:
+                        coerced[key] = ann(value)
                 except (ValueError, TypeError):
                     coerced[key] = value  # leave it; let the function raise
             else:

@@ -444,7 +444,6 @@ def _state(agent) -> dict:
             "browser":    None,
             "page":       None,
             "settings": {
-                "headless":               False,
                 "timeout_ms":             30000,
                 "wait_until":             "domcontentloaded",
                 "shift_enter_for_newline": True,
@@ -464,8 +463,9 @@ async def _ensure_page(agent):
     if st["page"] is not None:
         return st["page"]
 
+    headless = st.get("_headless", True)
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(headless=st["settings"]["headless"])
+    browser = await pw.chromium.launch(headless=headless)
     page = await browser.new_page()
 
     # Block requests (including redirects) to private/internal addresses.
@@ -596,7 +596,6 @@ def register_agent(agent) -> None:
     st = _state(agent)
     st["downloads_dir"] = downloads_dir
     st["settings"].update({
-        "headless":               cfg.get("headless", False),
         "timeout_ms":             cfg.get("timeout_ms", 30000),
         "wait_until":             cfg.get("wait_until", "domcontentloaded"),
         "shift_enter_for_newline": cfg.get("shift_enter_for_newline", True),
@@ -675,20 +674,19 @@ def register_agent(agent) -> None:
     async def open_url(
         url: str,
         type: str = "text",
-        headless: bool | None = None,
+        headless: bool = True,
     ) -> str:
         """
         Open a URL in the browser and return its content.
-        If you hit a captcha or login wall, call with headless=False so the
-        browser window becomes visible and you can solve it manually.
+        Runs headless by default. Set headless=False to show the browser window
+        (useful for solving captchas or login walls manually).
 
         Args:
             url: The full URL to open (include https://).
             type: What to return — "text" (visible page text, default),
                   "html" (raw HTML markup), or "elements" (interactive element map).
-            headless: Override the session headless setting for this request.
-                      None = use session default. False = show browser window
-                      (useful for captchas). True = force headless.
+            headless: Whether to run the browser headlessly (default True).
+                      Set False to show the browser window for manual interaction.
         """
         st  = _state(agent)
         err = _validate_browse_url(url)
@@ -704,13 +702,10 @@ def register_agent(agent) -> None:
             return "Error: type must be 'elements', 'text', or 'html'."
 
         try:
-            # Override headless for this request if specified
-            original_headless = st["settings"]["headless"]
-            if headless is not None:
-                st["settings"]["headless"] = headless
-                # If a browser is already open with the wrong headless mode, close and reopen
-                if st["browser"] is not None:
-                    await _close_browser(agent)
+            # If a browser is already open with a mismatched headless mode, close it.
+            if st["browser"] is not None and st.get("_headless") != headless:
+                await _close_browser(agent)
+            st["_headless"] = headless
 
             try:
                 page     = await _ensure_page(agent)
@@ -736,11 +731,6 @@ def register_agent(agent) -> None:
                     content = _html_to_text(html, st["settings"]["ignore_tags"])
                 content, truncated = _truncate_content(content, st["settings"]["browse_max_chars"])
                 title = await page.title() or _extract_html_title(html) or ""
-
-            finally:
-                # Always restore the session headless setting
-                if headless is not None:
-                    st["settings"]["headless"] = original_headless
 
             suffix     = "\n[truncated]" if truncated else ""
             title_line = f"# {title}\n" if title else ""
@@ -931,7 +921,7 @@ def register_agent(agent) -> None:
             return await _close_browser(agent)
 
         elif a == "view_settings":
-            return json.dumps(st["settings"], indent=2)
+            return json.dumps({**st["settings"], "_headless": st.get("_headless", True)}, indent=2)
 
         elif a == "set_setting":
             if not key or value is None:
@@ -993,16 +983,16 @@ def register_agent(agent) -> None:
     }
 
     _WEB_PERMISSIONS: dict[str, int] = {
-        "web_search":        25,
-        "open_url":          25,
+        "web_search":         25,
+        "open_url":           25,
         # http_request removed — deprecated.
-        "click":             50,
-        "type_text":         50,
-        "extract_text":      25,
-        "extract_html":      25,
+        "click":              30,
+        "type_text":          30,
+        "extract_text":       25,
+        "extract_html":       25,
         "screenshot_browser": 25,
-        "wait_for":          25,
-        "manage_browser":    50,
+        "wait_for":           25,
+        "manage_browser":     40,
     }
 
     for fn in (
