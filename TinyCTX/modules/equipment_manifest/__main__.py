@@ -71,6 +71,8 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, TemplateNotFound, TemplateSyntaxError
 
+from TinyCTX.context import HOOK_PRE_ASSEMBLE_ASYNC
+
 logger = logging.getLogger(__name__)
 
 # Module-level reference set by register_runtime.
@@ -103,13 +105,20 @@ def _build_variables(agent, ctx=None, trusted_threshold: int = 90, last_message_
     session = ctx.state.get("session", {}) if ctx is not None else {}
     is_group_chat = bool(session.get("server_name"))
     platform = session.get("platform") or ""
-    author_id = session.get("author_id") or ""
+    # author_id lives on HistoryEntry nodes, not in session state.
+    # Find it from the most recent user turn in dialogue.
+    author_id = ""
+    if ctx is not None:
+        for entry in reversed(ctx.dialogue):
+            if entry.role == "user" and entry.author_id:
+                author_id = entry.author_id
+                break
     # Trust check — applies in both DMs and group chats.
     trusted = False
     if _users is not None and platform and author_id:
         try:
             from TinyCTX.contracts import Platform
-            user = _users.get_by_platform_id(Platform(platform), author_id)
+            user = _users.get_by_platform(Platform(platform), author_id)
             trusted = user is not None and user.permission_level >= trusted_threshold
         except Exception as exc:
             logger.debug("[equipment_manifest] trusted lookup failed: %s", exc)
@@ -159,12 +168,17 @@ def _build_static_variables(agent, ctx=None, trusted_threshold: int = 90) -> dic
     session = ctx.state.get("session", {}) if ctx is not None else {}
     is_group_chat = bool(session.get("server_name"))
     platform = session.get("platform") or ""
-    author_id = session.get("author_id") or ""
+    author_id = ""
+    if ctx is not None:
+        for entry in reversed(ctx.dialogue):
+            if entry.role == "user" and entry.author_id:
+                author_id = entry.author_id
+                break
     trusted = False
     if _users is not None and platform and author_id:
         try:
             from TinyCTX.contracts import Platform
-            user = _users.get_by_platform_id(Platform(platform), author_id)
+            user = _users.get_by_platform(Platform(platform), author_id)
             trusted = user is not None and user.permission_level >= trusted_threshold
         except Exception as exc:
             logger.debug("[equipment_manifest] trusted lookup failed: %s", exc)

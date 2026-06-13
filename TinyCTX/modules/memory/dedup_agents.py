@@ -193,7 +193,7 @@ async def run_edge_dedup(
     sharing the same (source uuid, target uuid, relation) triple. For each
     such group, the most recently created edge is kept and the rest are deleted.
     """
-    logger.info("[memory/librarian] edge dedup starting")
+    logger.debug("[memory/librarian] edge dedup starting")
     try:
         r = await conn.execute(
             "MATCH (a:Entity)-[r:Relation]->(b:Entity) "
@@ -215,7 +215,7 @@ async def run_edge_dedup(
             to_delete.extend((src, tgt, rel, ca) for (ca,) in edges[1:])
 
         if not to_delete:
-            logger.info("[memory/librarian] edge dedup: no duplicate edges found")
+            agent_logger.debug("[edge dedup] no duplicate edges found")
             return
 
         logger.info("[memory/librarian] edge dedup: deleting %d duplicate edge(s)", len(to_delete))
@@ -237,7 +237,7 @@ async def run_edge_dedup(
                         src, tgt, rel, created_at, exc,
                     )
 
-        logger.info("[memory/librarian] edge dedup complete")
+        logger.debug("[memory/librarian] edge dedup complete")
     except Exception:
         logger.exception("[memory/librarian] edge dedup error")
 
@@ -266,7 +266,7 @@ async def run_dedup_cycle(
     2. Stale-only comparison: only pairs where >= 1 side was re-embedded.
     3. SQLite distinct-pair cache: confirmed-distinct pairs persist across restarts.
     """
-    logger.info("[memory/librarian] dedup cycle starting")
+    logger.debug("[memory/librarian] dedup cycle starting")
     try:
         from TinyCTX.modules.memory.graph import (
             embed_content_with_edges, embed_hash, cosine_similarity,
@@ -286,7 +286,7 @@ async def run_dedup_cycle(
             entities.append(dict(zip(col_names, r.get_next())))
 
         if len(entities) < 2:
-            logger.info("[memory/librarian] dedup: fewer than 2 entities, skipping")
+            logger.debug("[memory/librarian] dedup: fewer than 2 entities, skipping")
             return
 
         distinct_cache = _load_distinct_cache(workspace_path)
@@ -322,7 +322,8 @@ async def run_dedup_cycle(
                 stale.append(e)
 
         if stale:
-            logger.info("[memory/librarian] dedup: refreshing %d stale graph embedding(s)", len(stale))
+            agent_logger.info("[dedup] refreshing %d stale graph embedding(s)", len(stale))
+            logger.debug("[memory/librarian] dedup: refreshing %d stale graph embedding(s)", len(stale))
             for e in stale:
                 _invalidate_cache_for(distinct_cache, e["e.uuid"])
                 _invalidate_db_for(workspace_path, e["e.uuid"])
@@ -349,7 +350,7 @@ async def run_dedup_cycle(
                     e["e.graph_embed_model"]   = graph_embed_model_name
                     e["e.graph_embed_hash"]    = h
         else:
-            logger.info("[memory/librarian] dedup: all embeddings current, no pairs to re-evaluate")
+            logger.debug("[memory/librarian] dedup: all embeddings current, no pairs to re-evaluate")
             return
 
         # Build candidate pairs (stale × all, deduplicated)
@@ -394,7 +395,7 @@ async def run_dedup_cycle(
                         candidates.append((ea, eb, 1.0))
 
         if not candidates:
-            logger.info("[memory/librarian] dedup: no candidate pairs above threshold %.2f", threshold)
+            logger.debug("[memory/librarian] dedup: no candidate pairs above threshold %.2f", threshold)
             return
 
         # Filter already-aliased and cached-distinct pairs
@@ -415,12 +416,16 @@ async def run_dedup_cycle(
         ]
 
         if not filtered:
-            logger.info("[memory/librarian] dedup: all candidates already resolved")
+            logger.debug("[memory/librarian] dedup: all candidates already resolved")
             return
 
         # Partition into pivot-anchored groups, evaluate each with one LLM call
         components = _pivot_partition(filtered, batch_size)
-        logger.info(
+        agent_logger.info(
+            "[dedup] %d candidate(s) → %d group(s) (batch_size=%d)",
+            len(filtered), len(components), batch_size,
+        )
+        logger.debug(
             "[memory/librarian] dedup: %d candidate(s) → %d group(s) (batch_size=%d)",
             len(filtered), len(components), batch_size,
         )
@@ -433,7 +438,8 @@ async def run_dedup_cycle(
                 _add_to_cache(workspace_path, uid_a, uid_b)
                 distinct_cache.add(frozenset([uid_a, uid_b]))
 
-        logger.info("[memory/librarian] dedup cycle complete")
+        logger.debug("[memory/librarian] dedup cycle complete")
+        agent_logger.info("[dedup] cycle complete")
     except Exception:
         logger.exception("[memory/librarian] dedup cycle error")
 

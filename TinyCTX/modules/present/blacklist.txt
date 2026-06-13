@@ -1,0 +1,9 @@
+SOUL.md
+AGENTS.md
+TOOLS.md
+MEMORY.md
+HEARTBEAT.md
+CRON.json
+agent.db
+users.db
+memory/
