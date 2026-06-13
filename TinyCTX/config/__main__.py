@@ -325,7 +325,7 @@ def load(path="config.yaml") -> Config:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Config file not found: {p.resolve()}")
-    with p.open() as f:
+    with p.open(encoding="utf-8-sig") as f:
         raw = yaml.safe_load(f) or {}
 
     # ------------------------------------------------------------------ models
