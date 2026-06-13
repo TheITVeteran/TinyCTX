@@ -707,30 +707,29 @@ def register_agent(agent) -> None:
                 await _close_browser(agent)
             st["_headless"] = headless
 
-            try:
-                page     = await _ensure_page(agent)
-                response = await page.goto(
-                    url,
-                    wait_until=st["settings"]["wait_until"],
-                    timeout=st["settings"]["timeout_ms"],
+            page     = await _ensure_page(agent)
+            response = await page.goto(
+                url,
+                wait_until=st["settings"]["wait_until"],
+                timeout=st["settings"]["timeout_ms"],
+            )
+            status = response.status if response else 200
+
+            if mode == "elements":
+                elements = await _dynamic_discovery(agent)
+                return (
+                    f"Opened {url} (status {status}).\n"
+                    f"Elements: {json.dumps(elements, indent=2)}\n"
+                    "Use open_url with type='text' or type='html' for full page content."
                 )
-                status = response.status if response else 200
 
-                if mode == "elements":
-                    elements = await _dynamic_discovery(agent)
-                    return (
-                        f"Opened {url} (status {status}).\n"
-                        f"Elements: {json.dumps(elements, indent=2)}\n"
-                        "Use open_url with type='text' or type='html' for full page content."
-                    )
-
-                html = await page.content()
-                if mode == "html":
-                    content = html
-                else:
-                    content = _html_to_text(html, st["settings"]["ignore_tags"])
-                content, truncated = _truncate_content(content, st["settings"]["browse_max_chars"])
-                title = await page.title() or _extract_html_title(html) or ""
+            html = await page.content()
+            if mode == "html":
+                content = html
+            else:
+                content = _html_to_text(html, st["settings"]["ignore_tags"])
+            content, truncated = _truncate_content(content, st["settings"]["browse_max_chars"])
+            title = await page.title() or _extract_html_title(html) or ""
 
             suffix     = "\n[truncated]" if truncated else ""
             title_line = f"# {title}\n" if title else ""

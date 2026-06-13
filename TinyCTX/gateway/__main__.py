@@ -698,6 +698,10 @@ def _make_app(runtime, cfg: GatewayConfig, shutdown_event: asyncio.Event) -> web
 
 
 async def run(runtime, cfg: GatewayConfig) -> None:
+    # Suppress aiohttp's default access log — it logs every request with
+    # the remote IP, which leaks caller addresses into the main log.
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+
     shutdown_event = asyncio.Event()
     app    = _make_app(runtime, cfg, shutdown_event)
     runner = web.AppRunner(app)
