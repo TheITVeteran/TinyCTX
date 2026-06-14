@@ -208,6 +208,7 @@ async def handle_reset_interaction(
 
     if cursor_key:
         bridge._reset_epoch[cursor_key] = bridge._reset_epoch.get(cursor_key, 0) + 1
+        bridge._pending.pop(cursor_key, None)
         new_node_id = make_session_node(bridge._runtime.db, cursor_key)
         bridge._store.set(cursor_key, new_node_id)
         logger.info(

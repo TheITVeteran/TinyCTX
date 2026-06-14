@@ -15,7 +15,7 @@ Decomposed sub-modules:
   mentions.py  — humanize_mentions / dehumanize_mentions
   compat.py    — CompatRules (proxy-bot delay rules)
   cursors.py   — CursorStore, make_session_node
-  turn.py      — handle_turn, typing_keepalive
+  turn.py      — handle_turn, run_turn_loop, typing_keepalive
   commands.py  — sync_app_commands, slash-command interaction handlers
 """
 from __future__ import annotations
@@ -120,6 +120,12 @@ class DiscordBridge:
         self._reset_epoch:      dict[str, int]                    = {}
         self._lane_locks:       dict[str, asyncio.Lock]           = {}
 
+        # Buffering: while a turn is generating for a cursor, further
+        # trigger messages for that same cursor are buffered instead of
+        # starting a new (overlapping) turn.
+        self._generating:       dict[str, bool]                   = {}
+        self._pending:          dict[str, list[InboundMessage]]   = {}
+
         # Persisted cursor store
         workspace   = Path(runtime.config.workspace.path).expanduser().resolve()
         cursors_dir = workspace / "cursors"
@@ -223,6 +229,48 @@ class DiscordBridge:
     def _advance_cursor(self, cursor_key: str, new_tail: str) -> None:
         self._store.set(cursor_key, new_tail)
         logger.info("Discord: cursor %s advanced to %s", cursor_key, new_tail)
+
+    # ------------------------------------------------------------------
+    # Turn dispatch / buffering
+    # ------------------------------------------------------------------
+
+    def _dispatch_turn(
+        self,
+        msg: InboundMessage,
+        channel: discord.abc.Messageable,
+        cursor_key: str,
+    ) -> None:
+        """
+        Start an agent turn for msg, unless a turn is already generating for
+        cursor_key — in that case, buffer msg and let run_turn_loop() pick it
+        up once the in-flight turn finishes.
+        """
+        if self._generating.get(cursor_key):
+            self._pending.setdefault(cursor_key, []).append(msg)
+            logger.debug(
+                "Discord: agent busy for %s — buffering message %s",
+                cursor_key, msg.message_id,
+            )
+            return
+
+        self._generating[cursor_key] = True
+        task = asyncio.create_task(
+            _turn_module.run_turn_loop(self, msg, channel, cursor_key)
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _push_passive(self, msg: InboundMessage, cursor_key: str) -> None:
+        """Record a non-triggering message in the conversation history."""
+        lock = self._lane_locks.setdefault(cursor_key, asyncio.Lock())
+        async with lock:
+            node_id = self._get_or_create_cursor(cursor_key)
+            new_node_id = await self._runtime.push(
+                dataclasses.replace(msg, tail_node_id=node_id, trigger=False)
+            )
+            self._advance_cursor(cursor_key, new_node_id)
+            if msg.message_id:
+                self._store.set_msg_node(msg.message_id, new_node_id)
 
     # ------------------------------------------------------------------
     # Permission helpers
@@ -505,11 +553,7 @@ class DiscordBridge:
                 trigger=True,
                 reply_to_author=reply_to_author_dm,
             )
-            task = asyncio.create_task(
-                _turn_module.handle_turn(self, msg, message.channel, cursor_key)
-            )
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            self._dispatch_turn(msg, message.channel, cursor_key)
             return
 
         # ── Group channel ─────────────────────────────────────────────
@@ -606,21 +650,9 @@ class DiscordBridge:
                 except Exception:
                     pass
                 if msg_.trigger:
-                    task = asyncio.create_task(
-                        _turn_module.handle_turn(self, msg_, ch, ck)
-                    )
-                    self._tasks.add(task)
-                    task.add_done_callback(self._tasks.discard)
+                    self._dispatch_turn(msg_, ch, ck)
                 else:
-                    lock = self._lane_locks.setdefault(ck, asyncio.Lock())
-                    async with lock:
-                        node_id = self._get_or_create_cursor(ck)
-                        new_node_id = await self._runtime.push(
-                            dataclasses.replace(msg_, tail_node_id=node_id)
-                        )
-                        self._advance_cursor(ck, new_node_id)
-                        if msg_.message_id:
-                            self._store.set_msg_node(msg_.message_id, new_node_id)
+                    await self._push_passive(msg_, ck)
 
             task = asyncio.create_task(_delayed())
             self._tasks.add(task)
@@ -628,22 +660,10 @@ class DiscordBridge:
             return
 
         if not is_trigger:
-            lock = self._lane_locks.setdefault(cursor_key, asyncio.Lock())
-            async with lock:
-                node_id = self._get_or_create_cursor(cursor_key)
-                new_node_id = await self._runtime.push(
-                    dataclasses.replace(msg, tail_node_id=node_id)
-                )
-                self._advance_cursor(cursor_key, new_node_id)
-                if msg.message_id:
-                    self._store.set_msg_node(msg.message_id, new_node_id)
+            await self._push_passive(msg, cursor_key)
             return
 
-        task = asyncio.create_task(
-            _turn_module.handle_turn(self, msg, message.channel, cursor_key)
-        )
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._dispatch_turn(msg, message.channel, cursor_key)
 
     # ------------------------------------------------------------------
     # Thread message handler
@@ -718,11 +738,7 @@ class DiscordBridge:
             trigger=True,
             reply_to_author=reply_to_author_thread,
         )
-        task = asyncio.create_task(
-            _turn_module.handle_turn(self, msg, message.channel, cursor_key)
-        )
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._dispatch_turn(msg, message.channel, cursor_key)
 
     # ------------------------------------------------------------------
     # Entry point
