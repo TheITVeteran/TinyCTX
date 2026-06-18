@@ -27,9 +27,12 @@ Once either threshold is hit, remaining files are reference-only regardless of k
 
 Soft dependencies
 -----------------
-pdfplumber   --" PDF text extraction.  If absent, PDFs get a stub reference note.
-python-docx  --" DOCX text extraction. If absent, DOCX files get a stub reference note.
-Neither is required; attachments.py degrades gracefully.
+pdfplumber           --" PDF text extraction.  If absent, PDFs get a stub reference note.
+python-docx          --" DOCX text extraction. If absent, DOCX files get a stub reference note.
+rapidocr_onnxruntime --" OCR fallback for scanned PDF pages and embedded DOCX images.
+                         If absent, those pages/images just fall back to whatever the
+                         text layer already produced (no hard failure).
+None are required; attachments.py degrades gracefully.
 """
 
 from __future__ import annotations
@@ -241,31 +244,97 @@ def _convert_to_png(data: bytes) -> bytes | None:
 # Text extraction helpers (soft deps)
 # ---------------------------------------------------------------------------
 
-def _extract_pdf_text(data: bytes) -> str | None:
-    """Extract text from a PDF using pdfplumber.  Returns None if unavailable."""
+_MIN_CHARS_PER_PAGE = 20  # below this, treat a PDF page as scanned and try OCR
+_ocr_engine = None        # lazily-constructed RapidOCR singleton (model load is expensive)
+
+
+def _get_ocr_engine():
+    """Lazily construct and cache the RapidOCR engine.  Raises ImportError if absent."""
+    global _ocr_engine
+    if _ocr_engine is None:
+        from rapidocr_onnxruntime import RapidOCR
+        _ocr_engine = RapidOCR()
+    return _ocr_engine
+
+
+def _ocr_image(img) -> str | None:
+    """Run RapidOCR on a PIL image.  Returns None if rapidocr_onnxruntime is unavailable."""
     try:
-        import io
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(data)) as pdf:
-            pages = [page.extract_text() or "" for page in pdf.pages]
-        return "\n\n".join(p for p in pages if p.strip()) or None
+        import numpy as np
+        engine = _get_ocr_engine()
+        result, _ = engine(np.array(img))
+        return "\n".join(line[1] for line in result) if result else None
     except ImportError:
         return None
     except Exception as exc:
+        logger.warning("RapidOCR failed: %s", exc)
+        return None
+
+
+def _extract_pdf_text(data: bytes) -> str | None:
+    """
+    Extract text from a PDF using pdfplumber's text layer.  Pages with little or
+    no extractable text (scanned/image pages) are rasterized and run through
+    RapidOCR as a fallback.  Returns None if pdfplumber is unavailable.
+    """
+    try:
+        import io
+        import pdfplumber
+    except ImportError:
+        return None
+
+    pages: list[str] = []
+    try:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            for page in pdf.pages:
+                text = (page.extract_text() or "").strip()
+                if len(text) < _MIN_CHARS_PER_PAGE:
+                    ocr_text = _ocr_image(page.to_image(resolution=150).original)
+                    if ocr_text:
+                        text = ocr_text
+                pages.append(text)
+    except Exception as exc:
         logger.warning("PDF text extraction failed: %s", exc)
         return None
+    return "\n\n".join(p for p in pages if p.strip()) or None
 
 
 def _extract_docx_text(data: bytes) -> str | None:
-    """Extract text from a DOCX using python-docx.  Returns None if unavailable."""
+    """
+    Extract text from a DOCX using python-docx: paragraphs, table cells, and
+    OCR of embedded images (covers pasted screenshots / scanned pages).
+    Returns None if python-docx is unavailable.
+    """
     try:
         import io
         from docx import Document
-        doc = Document(io.BytesIO(data))
-        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-        return "\n\n".join(paragraphs) or None
     except ImportError:
         return None
+
+    try:
+        doc = Document(io.BytesIO(data))
+        parts: list[str] = [p.text for p in doc.paragraphs if p.text.strip()]
+
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells]
+                if any(cells):
+                    parts.append(" | ".join(cells))
+
+        for shape in doc.inline_shapes:
+            try:
+                from PIL import Image
+                rId = shape._inline.graphic.graphicData.pic.blipFill.blip.embed
+                blob = doc.part.related_parts[rId].blob
+                ocr_text = _ocr_image(Image.open(io.BytesIO(blob)))
+                if ocr_text:
+                    parts.append(ocr_text)
+            except ImportError:
+                break  # Pillow unavailable -- skip remaining images, keep text/tables
+            except Exception:
+                continue
+
+        return "\n\n".join(parts) or None
     except Exception as exc:
         logger.warning("DOCX text extraction failed: %s", exc)
         return None
