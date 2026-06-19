@@ -172,3 +172,37 @@ async def handle_turn(
                     await keepalive_task
                 except asyncio.CancelledError:
                     pass
+
+
+async def run_turn_loop(
+    bridge: "DiscordBridge",
+    msg: InboundMessage,
+    channel: discord.abc.Messageable,
+    cursor_key: str,
+) -> None:
+    """
+    Drive handle_turn() for cursor_key, then drain any messages that were
+    buffered (in bridge._pending) while the agent was generating.
+
+    If messages arrived while busy, every buffered message except the last
+    is recorded as passive context (bridge._push_passive), and the last one
+    becomes the trigger for another handle_turn() pass — so a burst of
+    messages sent while the agent is replying gets answered together in one
+    follow-up turn, rather than one turn per message.
+
+    bridge._generating[cursor_key] stays True for the whole loop so that
+    _dispatch_turn() keeps buffering incoming messages until we're done.
+    """
+    try:
+        while True:
+            await handle_turn(bridge, msg, channel, cursor_key)
+
+            pending = bridge._pending.pop(cursor_key, None)
+            if not pending:
+                break
+
+            *rest, msg = pending
+            for passive in rest:
+                await bridge._push_passive(passive, cursor_key)
+    finally:
+        bridge._generating[cursor_key] = False

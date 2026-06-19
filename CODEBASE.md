@@ -66,7 +66,7 @@ TinyCTX/
     ├── skills/         use_skill tool (loads SKILL.md files)
     ├── subagents/      spawn_agent / wait_agent tools
     ├── sysops/         System operation tools (model switching, abort, etc.)
-    ├── system_prompt/  Injects SOUL.md, AGENTS.md, MEMORY.md into system prompt
+    ├── system_prompt/  Injects SOUL.md, AGENTS.md into system prompt
     ├── todo/           todo_read / todo_write tools (per-session task list)
     └── web/            web_search / open_url tools (DuckDuckGo + Playwright)
 ```
@@ -150,6 +150,8 @@ Key methods:
    - `HOOK_FILTER_TURN` — `fn(entry, age, ctx) → bool` — drop turns
    - `HOOK_TRANSFORM_TURN` — `fn(entry, age, ctx) → HistoryEntry | None` — replace/compress turns
    - `HOOK_POST_ASSEMBLE` — `fn(messages, ctx) → list[dict] | None` — final reshape
+
+User turns with `author_id` set are prefixed with `【author_id】: ` (fullwidth brackets, U+3010/U+3011) after the hook pipeline runs. Before prefixing, `_sanitize_brackets()` normalizes Unicode bracket look-alikes in the message content to ASCII, so this exact delimiter cannot be forged by user-supplied text.
 
 After hook processing, adjacent same-role messages are merged. Then token budget enforcement trims oldest non-system turns until the count fits.
 
@@ -290,11 +292,11 @@ Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
 
 ## Notable Modules
 
-### `system_prompt` — injects SOUL.md, AGENTS.md, MEMORY.md, TOOLS.md into every system prompt via `register_prompt` providers.
+### `system_prompt` — injects SOUL.md, AGENTS.md,, TOOLS.md into every system prompt via `register_prompt` providers.
 
 ### `rag` — indexes `workspace/memory/*.md` files; auto-injects relevant chunks each turn (BM25 or embedding cosine similarity); provides `memory_search` tool; triggers background memory consolidation when context budget is near.
 
-### `memory` — LadybugDB property-graph knowledge store. A background "librarian" walks unvisited conversation nodes (tracked with DB flags), extracts entities/relationships via sub-agents, and writes to the graph. Main agent uses `kg_search` / `kg_traverse` / `call_librarian` tools. Pinned entities are injected into the system prompt. The librarian identifies the agent by reading `author_id` on assistant nodes (set from session state `agent_name`); this is how it knows which speaker is the agent vs the user in the conversation transcript.
+### `memory` — LadybugDB property-graph knowledge store. A background "librarian" walks unvisited conversation nodes (tracked with DB flags), extracts entities/relationships via sub-agents, and writes to the graph. Main agent uses `kg_search` / `kg_traverse` / `call_librarian` tools. Pinned entities are injected into the system prompt. The librarian identifies the agent by reading `author_id` on assistant nodes (set from session state `agent_name`); this is how it knows which speaker is the agent vs the user in the conversation transcript. Conversation excerpts passed to the buffer agent are rendered by `nodes_to_text()` (`librarian_agents.py`) as `【author】: content` lines (fullwidth brackets, matching `context.py`'s convention); content is passed through `_sanitize_brackets()` first so it cannot forge this delimiter.
 
 ### `heartbeat` — fires periodic agent turns on a background DB branch at a configured interval. Suppresses `HEARTBEAT_OK` replies. Slash command: `/heartbeat run`.
 
@@ -341,7 +343,6 @@ agent.db          Conversation tree (SQLite)
 cursors/          Per-bridge session cursors (CLI resume)
 SOUL.md           Agent personality (loaded every turn)
 AGENTS.md         Sub-agent/persona definitions
-MEMORY.md         Long-term facts always in context
 memory/           Semantic search corpus (*.md files, subdirs OK)
 downloads/        Files/images sent by users via bridges
 CRON.json         Scheduled jobs

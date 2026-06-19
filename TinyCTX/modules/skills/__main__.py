@@ -41,11 +41,15 @@ Convention: register_agent(agent) — no imports from gateway or bridges.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any
+
+from TinyCTX.context import HOOK_PRE_ASSEMBLE_ASYNC
 
 logger = logging.getLogger(__name__)
 
@@ -398,21 +402,60 @@ def register_agent(cycle) -> None:
         "skills":     {},   # name → SkillEntry
         "categories": {},   # path → CategoryNode
         "top_level":  [],   # ordered root-level items
+        "last_scan":  0.0,  # monotonic time of last completed _discover()
     }
+    _refresh_lock = asyncio.Lock()
 
-    def _refresh() -> tuple[dict, dict, list]:
+    # Re-scan at most this often (seconds). The filesystem walk runs in a
+    # worker thread (see _refresh_async below) so it never blocks the loop,
+    # but we still cap frequency to avoid hammering disk every turn.
+    rescan_interval = float(cfg.get("rescan_interval_seconds", 30))
+
+    def _refresh_sync() -> tuple[dict, dict, list]:
+        """Blocking discovery scan. Only ever call this from a worker thread
+        (via asyncio.to_thread) — never directly on the event loop."""
         skills, categories, top_level = _discover(all_scan_dirs)
         _live["skills"]     = skills
         _live["categories"] = categories
         _live["top_level"]  = top_level
+        _live["last_scan"]  = time.monotonic()
         return skills, categories, top_level
+
+    async def _refresh_async(force: bool = False) -> None:
+        """Refresh the skills cache off the event loop. Safe to call from a
+        HOOK_PRE_ASSEMBLE_ASYNC hook every turn — it no-ops unless the cache
+        is stale (or force=True), and the actual disk walk runs in a thread."""
+        if not force and (time.monotonic() - _live["last_scan"]) < rescan_interval:
+            return
+        async with _refresh_lock:
+            # Re-check inside the lock in case another coroutine just refreshed.
+            if not force and (time.monotonic() - _live["last_scan"]) < rescan_interval:
+                return
+            try:
+                await asyncio.to_thread(_refresh_sync)
+            except Exception:
+                logger.exception("[skills] background rescan failed")
+
+    async def _pre_assemble_refresh(_ctx) -> None:
+        await _refresh_async()
+
+    agent.context.register_hook(
+        HOOK_PRE_ASSEMBLE_ASYNC,
+        _pre_assemble_refresh,
+    )
 
     # ------------------------------------------------------------------
     # System prompt — injects skill index every turn
     # ------------------------------------------------------------------
+    # NOTE: this is called synchronously inside Context.assemble() (the
+    # provider contract there is sync-only by design — see context.py).
+    # It must never touch disk. It only reads the in-memory cache, which
+    # is kept warm by _pre_assemble_refresh above (awaited by the agent
+    # via run_async_hooks(HOOK_PRE_ASSEMBLE_ASYNC) BEFORE assemble() runs).
 
     def _build_prompt(_ctx) -> str | None:
-        _, categories, top_level = _refresh()
+        top_level  = _live["top_level"]
+        categories = _live["categories"]
         expanded = set() if ephemeral else _load_expanded(agent)
         return _build_index_prompt(top_level, expanded, categories)
 
@@ -539,7 +582,7 @@ def register_agent(cycle) -> None:
     # Initial scan + logging
     # ------------------------------------------------------------------
 
-    skills, categories, _ = _refresh()
+    skills, categories, _ = _refresh_sync()
     n_skills = len(skills)
     n_cats   = len(categories)
 

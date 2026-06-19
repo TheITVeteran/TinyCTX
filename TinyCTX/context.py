@@ -46,9 +46,9 @@ from typing import Any, Callable
 import logging
 
 from TinyCTX.contracts import ToolCall, ToolResult
+from TinyCTX.utils.sanitize import sanitize_brackets as _sanitize_brackets
 
 logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Roles
@@ -565,8 +565,11 @@ class Context:
             if entry.role == ROLE_USER and entry.author_id is not None:
                 label = entry.author_id
                 raw = entry.content
+                # Fullwidth 【】 delimiters are visually distinct from ASCII []
+                # and cannot be spoofed by user content after bracket sanitization.
+                prefix = f"\u3010{label}\u3011: "  # 【label】:
                 if isinstance(raw, str):
-                    labelled_content: str | list = f"[{label}]: {raw}"
+                    labelled_content: str | list = prefix + _sanitize_brackets(raw)
                 else:
                     blocks = list(raw)
                     first_text: int | None = next(
@@ -574,9 +577,10 @@ class Context:
                     )
                     if first_text is not None:
                         existing = blocks[first_text]
-                        blocks[first_text] = {**existing, "text": f"[{label}]: {existing['text']}"}  # type: ignore[index]
+                        sanitized_text = _sanitize_brackets(existing["text"])
+                        blocks[first_text] = {**existing, "text": prefix + sanitized_text}  # type: ignore[index]
                     else:
-                        blocks.insert(0, {"type": "text", "text": f"[{label}]: "})
+                        blocks.insert(0, {"type": "text", "text": prefix})
                     labelled_content = blocks
                 from dataclasses import replace
                 entry = replace(entry, content=labelled_content)

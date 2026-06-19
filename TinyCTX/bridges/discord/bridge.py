@@ -15,7 +15,7 @@ Decomposed sub-modules:
   mentions.py  — humanize_mentions / dehumanize_mentions
   compat.py    — CompatRules (proxy-bot delay rules)
   cursors.py   — CursorStore, make_session_node
-  turn.py      — handle_turn, typing_keepalive
+  turn.py      — handle_turn, run_turn_loop, typing_keepalive
   commands.py  — sync_app_commands, slash-command interaction handlers
 """
 from __future__ import annotations
@@ -24,6 +24,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import random
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -61,10 +62,11 @@ DEFAULTS = {
     "dm_enabled": True,
     "dm_requires_permission": 75,       # minimum user registry level to use the bot in DMs
     "reset_requires_permission": 75,    # minimum user registry level to /reset in a server
-    "prefix_required": True,
-    "command_prefix": "!",
     "reset_command": "/reset",
     "shutdown_command": "/shutdown",
+    "keyword_listen_keywords": [],
+    "keyword_listen_timeout_s": 600,
+    "keyword_chance_keywords": {},     # {"word": 0.25} — always-on probabilistic trigger
     "buffer_timeout_s": 0,
     "buffer_head_lines": 2,
     "buffer_tail_lines": 10,
@@ -97,8 +99,6 @@ class DiscordBridge:
         self._typing_on_thinking: bool  = bool(self._opts["typing_on_thinking"])
         self._typing_on_tools:    bool  = bool(self._opts["typing_on_tools"])
         self._typing_on_reply:    bool  = bool(self._opts["typing_on_reply"])
-        self._prefix:             str   = str(self._opts["command_prefix"])
-        self._prefix_required:    bool  = bool(self._opts["prefix_required"])
         self._reset_command:      str   = str(self._opts["reset_command"])
         self._shutdown_command:   str   = str(self._opts["shutdown_command"])
         self._dm_enabled:         bool  = bool(self._opts["dm_enabled"])
@@ -112,6 +112,21 @@ class DiscordBridge:
         self._buffer_head_lines: int   = int(self._opts["buffer_head_lines"])
         self._buffer_tail_lines: int   = int(self._opts["buffer_tail_lines"])
 
+        # Keyword listen window: maps cursor_key -> expiry timestamp
+        self._keyword_listen_keywords: list[str] = [
+            kw.lower() for kw in self._opts["keyword_listen_keywords"]
+        ]
+        self._keyword_listen_timeout_s: float = float(
+            self._opts["keyword_listen_timeout_s"]
+        )
+        self._keyword_listen_expiry: dict[str, float] = {}
+
+        # Probabilistic keywords: {keyword_lower: probability}
+        self._keyword_chance: dict[str, float] = {
+            k.lower(): float(v)
+            for k, v in self._opts["keyword_chance_keywords"].items()
+        }
+
         # In-flight state (not persisted)
         self._typing_active:    dict[str, asyncio.Event]          = {}
         self._tasks:            set[asyncio.Task]                  = set()
@@ -119,6 +134,12 @@ class DiscordBridge:
         self._node_to_cursor:   dict[str, str]                    = {}
         self._reset_epoch:      dict[str, int]                    = {}
         self._lane_locks:       dict[str, asyncio.Lock]           = {}
+
+        # Buffering: while a turn is generating for a cursor, further
+        # trigger messages for that same cursor are buffered instead of
+        # starting a new (overlapping) turn.
+        self._generating:       dict[str, bool]                   = {}
+        self._pending:          dict[str, list[InboundMessage]]   = {}
 
         # Persisted cursor store
         workspace   = Path(runtime.config.workspace.path).expanduser().resolve()
@@ -225,6 +246,48 @@ class DiscordBridge:
         logger.info("Discord: cursor %s advanced to %s", cursor_key, new_tail)
 
     # ------------------------------------------------------------------
+    # Turn dispatch / buffering
+    # ------------------------------------------------------------------
+
+    def _dispatch_turn(
+        self,
+        msg: InboundMessage,
+        channel: discord.abc.Messageable,
+        cursor_key: str,
+    ) -> None:
+        """
+        Start an agent turn for msg, unless a turn is already generating for
+        cursor_key — in that case, buffer msg and let run_turn_loop() pick it
+        up once the in-flight turn finishes.
+        """
+        if self._generating.get(cursor_key):
+            self._pending.setdefault(cursor_key, []).append(msg)
+            logger.debug(
+                "Discord: agent busy for %s — buffering message %s",
+                cursor_key, msg.message_id,
+            )
+            return
+
+        self._generating[cursor_key] = True
+        task = asyncio.create_task(
+            _turn_module.run_turn_loop(self, msg, channel, cursor_key)
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _push_passive(self, msg: InboundMessage, cursor_key: str) -> None:
+        """Record a non-triggering message in the conversation history."""
+        lock = self._lane_locks.setdefault(cursor_key, asyncio.Lock())
+        async with lock:
+            node_id = self._get_or_create_cursor(cursor_key)
+            new_node_id = await self._runtime.push(
+                dataclasses.replace(msg, tail_node_id=node_id, trigger=False)
+            )
+            self._advance_cursor(cursor_key, new_node_id)
+            if msg.message_id:
+                self._store.set_msg_node(msg.message_id, new_node_id)
+
+    # ------------------------------------------------------------------
     # Permission helpers
     # ------------------------------------------------------------------
 
@@ -252,15 +315,39 @@ class DiscordBridge:
         required = int(self._opts["reset_requires_permission"])
         return self._user_permission_level(user_id) >= required
 
-    def _is_group_trigger(self, text: str) -> bool:
-        if not self._prefix_required:
-            return True
-        if text.startswith(self._prefix):
-            return True
+    def _is_group_trigger(self, text: str, cursor_key: str = "") -> bool:
         bot_name = self._client.user.name if self._client.user else ""
         if bot_name and f"@{bot_name}" in text:
             return True
+        # Keyword listen window: active after a direct trigger for up to timeout_s.
+        if cursor_key and self._keyword_listen_keywords:
+            expiry = self._keyword_listen_expiry.get(cursor_key, 0.0)
+            if time.time() < expiry:
+                text_lower = text.lower()
+                if any(kw in text_lower for kw in self._keyword_listen_keywords):
+                    return True
+        # Probabilistic keywords: always-on, each keyword has its own trigger chance.
+        if self._keyword_chance:
+            text_lower = text.lower()
+            for kw, chance in self._keyword_chance.items():
+                if kw in text_lower and random.random() < chance:
+                    logger.debug(
+                        "Discord: probabilistic keyword %r fired (%.0f%%) for %s",
+                        kw, chance * 100, cursor_key,
+                    )
+                    return True
         return False
+
+    def _refresh_keyword_listen(self, cursor_key: str) -> None:
+        """Reset the keyword-listen window for cursor_key to now + timeout."""
+        if self._keyword_listen_keywords and self._keyword_listen_timeout_s > 0:
+            self._keyword_listen_expiry[cursor_key] = (
+                time.time() + self._keyword_listen_timeout_s
+            )
+            logger.debug(
+                "Discord: keyword-listen window refreshed for %s (%.0fs)",
+                cursor_key, self._keyword_listen_timeout_s,
+            )
 
     def _dehumanize_mentions(self, text: str) -> str:
         return dehumanize_mentions(text, self._runtime)
@@ -505,11 +592,7 @@ class DiscordBridge:
                 trigger=True,
                 reply_to_author=reply_to_author_dm,
             )
-            task = asyncio.create_task(
-                _turn_module.handle_turn(self, msg, message.channel, cursor_key)
-            )
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            self._dispatch_turn(msg, message.channel, cursor_key)
             return
 
         # ── Group channel ─────────────────────────────────────────────
@@ -554,7 +637,7 @@ class DiscordBridge:
             username=message.author.name,
             display_name=message.author.display_name,
         )
-        is_trigger = self._is_group_trigger(text)
+        is_trigger = self._is_group_trigger(text, cursor_key)
         ref_group  = message.reference
         resolved_group = ref_group.resolved if ref_group else None
         reply_to_author_group: str | None = None
@@ -606,21 +689,9 @@ class DiscordBridge:
                 except Exception:
                     pass
                 if msg_.trigger:
-                    task = asyncio.create_task(
-                        _turn_module.handle_turn(self, msg_, ch, ck)
-                    )
-                    self._tasks.add(task)
-                    task.add_done_callback(self._tasks.discard)
+                    self._dispatch_turn(msg_, ch, ck)
                 else:
-                    lock = self._lane_locks.setdefault(ck, asyncio.Lock())
-                    async with lock:
-                        node_id = self._get_or_create_cursor(ck)
-                        new_node_id = await self._runtime.push(
-                            dataclasses.replace(msg_, tail_node_id=node_id)
-                        )
-                        self._advance_cursor(ck, new_node_id)
-                        if msg_.message_id:
-                            self._store.set_msg_node(msg_.message_id, new_node_id)
+                    await self._push_passive(msg_, ck)
 
             task = asyncio.create_task(_delayed())
             self._tasks.add(task)
@@ -628,22 +699,11 @@ class DiscordBridge:
             return
 
         if not is_trigger:
-            lock = self._lane_locks.setdefault(cursor_key, asyncio.Lock())
-            async with lock:
-                node_id = self._get_or_create_cursor(cursor_key)
-                new_node_id = await self._runtime.push(
-                    dataclasses.replace(msg, tail_node_id=node_id)
-                )
-                self._advance_cursor(cursor_key, new_node_id)
-                if msg.message_id:
-                    self._store.set_msg_node(msg.message_id, new_node_id)
+            await self._push_passive(msg, cursor_key)
             return
 
-        task = asyncio.create_task(
-            _turn_module.handle_turn(self, msg, message.channel, cursor_key)
-        )
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._refresh_keyword_listen(cursor_key)
+        self._dispatch_turn(msg, message.channel, cursor_key)
 
     # ------------------------------------------------------------------
     # Thread message handler
@@ -718,11 +778,7 @@ class DiscordBridge:
             trigger=True,
             reply_to_author=reply_to_author_thread,
         )
-        task = asyncio.create_task(
-            _turn_module.handle_turn(self, msg, message.channel, cursor_key)
-        )
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._dispatch_turn(msg, message.channel, cursor_key)
 
     # ------------------------------------------------------------------
     # Entry point
