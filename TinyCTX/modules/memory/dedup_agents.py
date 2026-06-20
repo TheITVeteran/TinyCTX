@@ -337,7 +337,7 @@ async def run_dedup_cycle(
                 )
                 for e in stale
             ]
-            vectors = await embedder.embed(texts)
+            vectors = await embedder.embed(texts, priority=15)
             async with write_lock:
                 for e, vec, txt in zip(stale, vectors, texts):
                     h   = embed_hash(txt)
@@ -496,6 +496,7 @@ async def _dedup_group(
         [{"role": "system", "content": _prompt("dedup_system.txt")},
          {"role": "user",   "content": prompt}],
         tools=None,
+        priority=15,
     ):
         if isinstance(event, TextDelta):
             response_text += event.text

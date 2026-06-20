@@ -255,22 +255,56 @@ No signature changes, no new params, no new imports needed in any of these
 files. They already hold an `llm`/`embedder` instance; they just pass one
 more kwarg into a method they're already calling.
 
-### `modules/memory/__main__.py` — `_YieldingLLM` is now redundant
+### `modules/memory/__main__.py` — `_YieldingLLM` removed (confirmed safe)
 
-This file is the one place that needs more than a one-liner, because it
-already has a hand-rolled version of "make background LLM calls wait their
-turn" (`_YieldingLLM`, busy-waiting on `self._is_busy()`). With priority
-ordering built into `ai.py` itself, this wrapper's job is now done by
-passing `priority=15` at the librarian's call site instead.
+Checked the call graph: `_user_cycles_active()` has two unrelated
+consumers today, and only one of them goes away.
 
-- Recommend deleting `_YieldingLLM` (~lines 85–102) and constructing
-  `LibrarianRunner`'s LLM directly: `self._llm = llm` instead of
-  `self._llm = _YieldingLLM(llm, self._user_cycles_active)`.
-- This is a recommendation, not a requirement of this plan — if Kamie wants
-  to keep `_YieldingLLM` as a belt-and-suspenders layer on top of queue
-  priority, that's fine too, it just becomes redundant rather than load-
-  bearing. Flagging because `_user_cycles_active()` may be used elsewhere;
-  worth a quick grep before deleting it outright.
+1. **`_YieldingLLM.stream()`** (lines ~86–101) busy-waits on
+   `_user_cycles_active()` before forwarding to the real `llm.stream(...)`.
+   This is pure LLM-call-ordering — exactly what `priority=` in `ai.py`
+   now does, more efficiently (no polling loop, no `asyncio.sleep(1)`
+   busy-wait). **Delete this class entirely.**
+2. **`_poll_cycle()`** (lines ~299, ~334) checks `_user_cycles_active()`
+   before *deciding whether to schedule new background tasks at all* —
+   node-walk ingestion and dedup. This is a scheduling decision ("don't
+   touch the write-locked DB/graph while a user turn is live"), not an
+   LLM-call-ordering decision. The priority queue has no opinion on
+   whether `run_buffer_agent`/`run_edge_dedup` tasks get created — it only
+   orders the LLM calls *inside* tasks that already exist. **This stays.**
+
+So the fix is precise: delete `_YieldingLLM`, keep `_user_cycles_active()`.
+
+```python
+# DELETE entirely (~lines 83-101):
+# ---------------------------------------------------------------------------
+# _YieldingLLM — pauses background LLM calls while user cycles are active
+# ---------------------------------------------------------------------------
+#
+# class _YieldingLLM:
+#     ...
+```
+
+```python
+# CHANGE — in LibrarianRunner.__init__ (~line 147):
+# before:
+self._llm = _YieldingLLM(llm, self._user_cycles_active)
+# after:
+self._llm = llm
+```
+
+Everywhere `self._llm.stream(...)` is called downstream (inside
+`librarian_agents.py` / `dedup_agents.py`, once those add `priority=15` per
+the table above) now hits the real `LLM.stream()` directly — which queues
+itself via `ai.py`, at lower priority than the user-facing `priority=0`
+calls. Net effect for `parallel: 1`: librarian/dedup work still waits its
+turn behind user turns, same outcome as before, but via one shared
+admission-controlled queue instead of a second, separate polling
+mechanism — and for `parallel > 1` it gets to run alongside a user turn
+instead of being hard-blocked, which `_YieldingLLM` never allowed.
+
+`LibrarianRunner.__init__`'s `runtime` parameter is unchanged — it's still
+needed for `_user_cycles_active()`, which `_poll_cycle()` keeps using.
 
 ---
 
@@ -356,7 +390,7 @@ Plain `int`, lower = more urgent, not enforced as an enum:
 | `TinyCTX/modules/memory/tools.py` | `embed_one(..., priority=5)` |
 | `TinyCTX/modules/rag/databanks.py` | `embed(..., priority=5)` |
 | `TinyCTX/modules/rag/indexer.py` | `embed(..., priority=20)` |
-| `TinyCTX/modules/memory/__main__.py` | (recommended, not required) delete `_YieldingLLM`, construct `LibrarianRunner`'s LLM directly |
+| `TinyCTX/modules/memory/__main__.py` | delete `_YieldingLLM` class; `LibrarianRunner.__init__` constructs `self._llm = llm` directly (no wrapper). `_user_cycles_active()` and its callers in `_poll_cycle()` are unchanged — confirmed they gate task scheduling, not LLM-call ordering. |
 | `config.yaml` | add `parallel: 1` |
 
 No changes to `runtime.py`, `module_registry.py`, `contracts.py`, `db.py`,

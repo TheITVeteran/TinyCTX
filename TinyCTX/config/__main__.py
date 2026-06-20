@@ -213,6 +213,7 @@ class Config:
     workspace:       WorkspaceConfig         = field(default_factory=WorkspaceConfig)
     logging:         LoggingConfig           = field(default_factory=LoggingConfig)
     max_tool_cycles: int                     = 20
+    parallel:        int                     = 3     # max concurrent LLM/embedding requests in flight
     context:         int                     = 16384
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
     permissions:     PermissionsConfig       = field(default_factory=PermissionsConfig)
@@ -317,7 +318,7 @@ def _parse_model(raw: dict) -> ModelConfig:
 # Known top-level keys — everything else goes into Config.extra
 _KNOWN_KEYS = {
     "models", "llm", "router", "bridges", "gateway", "workspace",
-    "logging", "max_tool_cycles", "context", "attachments", "permissions",
+    "logging", "max_tool_cycles", "parallel", "context", "attachments", "permissions",
 }
 
 
@@ -412,6 +413,11 @@ def load(path="config.yaml") -> Config:
         minimal_tokens=bool(perm_raw.get("minimal_tokens", False)),
     )
 
+    # ------------------------------------------------------------------ parallel
+    parallel = int(raw.get("parallel", 3))
+    if parallel < 1:
+        raise ValueError(f"parallel must be >= 1, got {parallel}")
+
     # ------------------------------------------------------------------ extra
     extra = {k: v for k, v in raw.items() if k not in _KNOWN_KEYS}
 
@@ -427,6 +433,7 @@ def load(path="config.yaml") -> Config:
         workspace=workspace,
         logging=LoggingConfig(level=log_raw.get("level", "INFO")),
         max_tool_cycles=int(raw.get("max_tool_cycles", 20)),
+        parallel=parallel,
         context=int(raw.get("context", 16384)),
         attachments=attachments,
         permissions=permissions,

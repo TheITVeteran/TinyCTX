@@ -143,7 +143,7 @@ class DataBankIndexer:
         embeddings: list[list[float]] | None = None
         if self._embedder is not None:
             try:
-                embeddings = await self._embedder.embed(chunks)
+                embeddings = await self._embedder.embed(chunks, priority=20)
             except Exception as exc:
                 logger.warning(
                     "[rag/indexer] [%s] embedding failed for %s: %s — BM25 only",

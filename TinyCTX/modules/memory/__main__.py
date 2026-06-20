@@ -80,31 +80,6 @@ _memory_block_cache: dict[str, str | None] = {"value": None}
 
 
 # ---------------------------------------------------------------------------
-# _YieldingLLM — pauses background LLM calls while user cycles are active
-# ---------------------------------------------------------------------------
-
-class _YieldingLLM:
-    """
-    Thin wrapper around LLM that waits for user cycles to finish before
-    each streaming request. Prevents background consolidation from
-    competing with real messages mid-generation.
-    """
-
-    def __init__(self, llm, is_busy_fn):
-        self._llm = llm
-        self._is_busy = is_busy_fn  # callable() -> bool
-
-    async def stream(self, messages, tools=None):
-        while self._is_busy():
-            await asyncio.sleep(1)
-        async for event in self._llm.stream(messages, tools):
-            yield event
-
-    def __getattr__(self, name):
-        return getattr(self._llm, name)
-
-
-# ---------------------------------------------------------------------------
 # LibrarianRunner — in-process background task
 # ---------------------------------------------------------------------------
 
@@ -143,8 +118,11 @@ class LibrarianRunner:
         # Falls back to the regular search embedder when None.
         self._graph_embedder = graph_embedder if graph_embedder is not None else embedder
 
-        # Wrap the LLM so background calls pause while user cycles are active.
-        self._llm = _YieldingLLM(llm, self._user_cycles_active)
+        # Background calls go through the same ai.py priority queue as the
+        # user-facing cycle (see librarian_agents.py / dedup_agents.py call
+        # sites, priority=15) — that's what makes background work wait its
+        # turn now, so no wrapper is needed here.
+        self._llm = llm
 
         # Dedicated file logger for all librarian agent text output
         self.agent_logger = logging.getLogger("memory.librarian.agent")
