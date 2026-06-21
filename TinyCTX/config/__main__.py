@@ -453,7 +453,12 @@ def apply_logging(cfg: LoggingConfig, *, level_override: str | int | None = None
         datefmt="%H:%M:%S",
     )
 
-    for _noisy in ("discord.gateway", "discord.client", "discord.http", "discord.state"):
+    for _noisy in (
+        "discord.gateway", "discord.client", "discord.http", "discord.state",
+        "pdfminer", "pdfminer.pdfinterp", "pdfminer.pdfpage", "pdfminer.psparser",
+        "pdfminer.cmapdb", "pdfminer.converter", "pdfminer.layout",
+        "pdfplumber", "PIL",
+    ):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
         
     structlog.configure(
