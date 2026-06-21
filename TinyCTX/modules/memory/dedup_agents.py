@@ -116,68 +116,6 @@ async def _aset(conn, uid: str, field: str, value):
 
 
 # ---------------------------------------------------------------------------
-# Pivot-based partitioning (Ailon-Charikar-Newman correlation clustering)
-# ---------------------------------------------------------------------------
-
-def _pivot_partition(
-    candidates: list[tuple[dict, dict, float]],
-    batch_size: int,
-) -> list[list[dict]]:
-    """
-    Partition candidate nodes into groups using the Pivot algorithm, a
-    3-approximation for correlation clustering (Ailon, Charikar, Newman 2008).
-
-    Every node in a group has a direct candidate edge to the pivot that anchored
-    it — unlike connected-component grouping, there are no transitively-included
-    bystanders.  This keeps LLM batches semantically tight.
-
-    Algorithm:
-      1. Shuffle nodes (randomised pivot gives the approximation guarantee).
-      2. Pick the first unprocessed node as pivot.
-      3. Cluster = pivot + all its unprocessed direct neighbours.
-      4. Emit the cluster (splitting into batch_size chunks if needed).
-      5. Remove all emitted nodes and repeat.
-
-    Splitting an oversized cluster is safe because the cluster is already dense
-    (every node has a direct edge to the pivot), so any contiguous slice still
-    contains high-quality candidate pairs.
-    """
-    import random
-
-    by_uuid: dict[str, dict] = {}
-    adjacency: dict[str, set[str]] = defaultdict(set)
-
-    for ea, eb, _ in candidates:
-        uid_a, uid_b = ea["e.uuid"], eb["e.uuid"]
-        by_uuid[uid_a] = ea
-        by_uuid[uid_b] = eb
-        adjacency[uid_a].add(uid_b)
-        adjacency[uid_b].add(uid_a)
-
-    order = list(by_uuid.keys())
-    random.shuffle(order)
-
-    processed: set[str] = set()
-    result: list[list[dict]] = []
-
-    for pivot in order:
-        if pivot in processed:
-            continue
-        # Cluster: pivot + unprocessed direct neighbours, pivot first
-        cluster = [pivot] + [
-            u for u in adjacency[pivot] if u not in processed and u != pivot
-        ]
-        processed.update(cluster)
-        # Split into batch_size chunks; every chunk contains the pivot (first
-        # element) only in the first chunk, but remaining chunks are still
-        # dense because all their members are direct neighbours of the pivot.
-        for i in range(0, len(cluster), batch_size):
-            result.append([by_uuid[u] for u in cluster[i:i + batch_size]])
-
-    return result
-
-
-# ---------------------------------------------------------------------------
 # Clique-based edge cover
 # ---------------------------------------------------------------------------
 
