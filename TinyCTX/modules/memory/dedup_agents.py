@@ -116,34 +116,43 @@ async def _aset(conn, uid: str, field: str, value):
 
 
 # ---------------------------------------------------------------------------
-# Pivot-based partitioning (Ailon-Charikar-Newman correlation clustering)
+# Clique-based edge cover
 # ---------------------------------------------------------------------------
 
-def _pivot_partition(
+def _clique_edge_cover(
     candidates: list[tuple[dict, dict, float]],
     batch_size: int,
 ) -> list[list[dict]]:
     """
-    Partition candidate nodes into groups using the Pivot algorithm, a
-    3-approximation for correlation clustering (Ailon, Charikar, Newman 2008).
+    Cover every candidate edge with at least one clique-batch, sized up to
+    batch_size, for a single LLM call each.
 
-    Every node in a group has a direct candidate edge to the pivot that anchored
-    it — unlike connected-component grouping, there are no transitively-included
-    bystanders.  This keeps LLM batches semantically tight.
+    This is a minimum clique edge cover problem (NP-hard in general; greedy
+    here). The requirement is edge coverage, not a disjoint node partition:
+    every candidate pair must be co-present in at least one batch so the LLM
+    actually gets asked to compare it. A disjoint partition (e.g. randomised
+    pivot clustering) does not guarantee this — a node can lose all its
+    candidate edges to earlier-claimed pivots and end up alone, silently
+    dropping every pair it was part of.
+
+    Batches must stay true cliques in the candidate graph: _dedup_group
+    treats every pair inside a returned batch as having been implicitly
+    compared by the LLM (any pair not in a merge op is assumed distinct), so
+    a batch can only contain nodes that are mutual candidate-neighbours of
+    every other node already in it.
 
     Algorithm:
-      1. Shuffle nodes (randomised pivot gives the approximation guarantee).
-      2. Pick the first unprocessed node as pivot.
-      3. Cluster = pivot + all its unprocessed direct neighbours.
-      4. Emit the cluster (splitting into batch_size chunks if needed).
-      5. Remove all emitted nodes and repeat.
+      1. Track uncovered edges in a set.
+      2. While uncovered edges remain: pick any uncovered edge (u, v), seed
+         a batch with {u, v}.
+      3. Greedily extend the batch with nodes that are candidate-neighbours
+         of every node currently in the batch, up to batch_size.
+      4. Mark every edge fully contained in the finished batch as covered.
+      5. Repeat until no uncovered edges remain.
 
-    Splitting an oversized cluster is safe because the cluster is already dense
-    (every node has a direct edge to the pivot), so any contiguous slice still
-    contains high-quality candidate pairs.
+    Nodes with no candidate edges never appear here (candidates is a list of
+    pairs), so every emitted batch has at least 2 members.
     """
-    import random
-
     by_uuid: dict[str, dict] = {}
     adjacency: dict[str, set[str]] = defaultdict(set)
 
@@ -154,25 +163,43 @@ def _pivot_partition(
         adjacency[uid_a].add(uid_b)
         adjacency[uid_b].add(uid_a)
 
-    order = list(by_uuid.keys())
-    random.shuffle(order)
+    uncovered: set[frozenset] = {
+        frozenset([ea["e.uuid"], eb["e.uuid"]]) for ea, eb, _ in candidates
+    }
 
-    processed: set[str] = set()
     result: list[list[dict]] = []
 
-    for pivot in order:
-        if pivot in processed:
-            continue
-        # Cluster: pivot + unprocessed direct neighbours, pivot first
-        cluster = [pivot] + [
-            u for u in adjacency[pivot] if u not in processed and u != pivot
-        ]
-        processed.update(cluster)
-        # Split into batch_size chunks; every chunk contains the pivot (first
-        # element) only in the first chunk, but remaining chunks are still
-        # dense because all their members are direct neighbours of the pivot.
-        for i in range(0, len(cluster), batch_size):
-            result.append([by_uuid[u] for u in cluster[i:i + batch_size]])
+    while uncovered:
+        # Any remaining uncovered edge seeds the next batch.
+        seed_edge = next(iter(uncovered))
+        u, v = tuple(seed_edge)
+        batch: list[str] = [u, v]
+        batch_set: set[str] = {u, v}
+
+        # Greedily extend with nodes adjacent to every current batch member,
+        # preferring candidates that cover the most still-uncovered edges.
+        if len(batch) < batch_size:
+            common = adjacency[u] & adjacency[v]
+            common -= batch_set
+            while common and len(batch) < batch_size:
+                def _uncovered_gain(node: str) -> int:
+                    return sum(
+                        1 for member in batch
+                        if frozenset([node, member]) in uncovered
+                    )
+                next_node = max(common, key=_uncovered_gain)
+                batch.append(next_node)
+                batch_set.add(next_node)
+                common &= adjacency[next_node]
+                common -= batch_set
+
+        # Mark every edge fully contained in this batch as covered.
+        for i in range(len(batch)):
+            for j in range(i + 1, len(batch)):
+                pair = frozenset([batch[i], batch[j]])
+                uncovered.discard(pair)
+
+        result.append([by_uuid[u] for u in batch])
 
     return result
 
@@ -305,6 +332,29 @@ async def run_dedup_cycle(
 
         graph_embed_model_name = getattr(embedder, "model", "")
 
+        # Name-based candidates: same name (case-insensitive). Computed before
+        # the stale-embedding check below, since an exact name collision is a
+        # duplicate signal on its own and shouldn't depend on whether anyone's
+        # embedding happens to be out of date.
+        pairs_seen: set[frozenset] = set()
+        candidates: list[tuple[dict, dict, float]] = []
+
+        by_name: dict[str, list[dict]] = {}
+        for e in entities:
+            key = (e["e.name"] or "").strip().lower()
+            if key:
+                by_name.setdefault(key, []).append(e)
+        for group in by_name.values():
+            if len(group) < 2:
+                continue
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    ea, eb = group[i], group[j]
+                    pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
+                    if pair_key not in pairs_seen:
+                        pairs_seen.add(pair_key)
+                        candidates.append((ea, eb, 1.0))
+
         stale: list[dict] = []
         for e in entities:
             uid   = e["e.uuid"]
@@ -337,7 +387,7 @@ async def run_dedup_cycle(
                 )
                 for e in stale
             ]
-            vectors = await embedder.embed(texts)
+            vectors = await embedder.embed(texts, priority=15)
             async with write_lock:
                 for e, vec, txt in zip(stale, vectors, texts):
                     h   = embed_hash(txt)
@@ -349,50 +399,29 @@ async def run_dedup_cycle(
                     e["e.graph_embedding"]     = vec
                     e["e.graph_embed_model"]   = graph_embed_model_name
                     e["e.graph_embed_hash"]    = h
+
+            # Build embedding-similarity candidates (stale × all, deduplicated)
+            for stale_e in stale:
+                emb_a = stale_e.get("e.graph_embedding") or stale_e.get("e.embedding") or []
+                if not emb_a:
+                    continue
+                uid_a = stale_e["e.uuid"]
+                for eb in entities:
+                    uid_b = eb["e.uuid"]
+                    if uid_a == uid_b:
+                        continue
+                    pair_key = frozenset([uid_a, uid_b])
+                    if pair_key in pairs_seen:
+                        continue
+                    pairs_seen.add(pair_key)
+                    emb_b = eb.get("e.graph_embedding") or eb.get("e.embedding") or []
+                    if not emb_b:
+                        continue
+                    score = cosine_similarity(emb_a, emb_b)
+                    if score >= threshold:
+                        candidates.append((stale_e, eb, score))
         else:
-            logger.debug("[memory/librarian] dedup: all embeddings current, no pairs to re-evaluate")
-            return
-
-        # Build candidate pairs (stale × all, deduplicated)
-        pairs_seen: set[frozenset] = set()
-        candidates: list[tuple[dict, dict, float]] = []
-
-        for stale_e in stale:
-            emb_a = stale_e.get("e.graph_embedding") or stale_e.get("e.embedding") or []
-            if not emb_a:
-                continue
-            uid_a = stale_e["e.uuid"]
-            for eb in entities:
-                uid_b = eb["e.uuid"]
-                if uid_a == uid_b:
-                    continue
-                pair_key = frozenset([uid_a, uid_b])
-                if pair_key in pairs_seen:
-                    continue
-                pairs_seen.add(pair_key)
-                emb_b = eb.get("e.graph_embedding") or eb.get("e.embedding") or []
-                if not emb_b:
-                    continue
-                score = cosine_similarity(emb_a, emb_b)
-                if score >= threshold:
-                    candidates.append((stale_e, eb, score))
-
-        # Name-based candidates: same name (case-insensitive)
-        by_name: dict[str, list[dict]] = {}
-        for e in entities:
-            key = (e["e.name"] or "").strip().lower()
-            if key:
-                by_name.setdefault(key, []).append(e)
-        for group in by_name.values():
-            if len(group) < 2:
-                continue
-            for i in range(len(group)):
-                for j in range(i + 1, len(group)):
-                    ea, eb = group[i], group[j]
-                    pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
-                    if pair_key not in pairs_seen:
-                        pairs_seen.add(pair_key)
-                        candidates.append((ea, eb, 1.0))
+            logger.debug("[memory/librarian] dedup: all embeddings current — name-collision candidates only")
 
         if not candidates:
             logger.debug("[memory/librarian] dedup: no candidate pairs above threshold %.2f", threshold)
@@ -419,8 +448,9 @@ async def run_dedup_cycle(
             logger.debug("[memory/librarian] dedup: all candidates already resolved")
             return
 
-        # Partition into pivot-anchored groups, evaluate each with one LLM call
-        components = _pivot_partition(filtered, batch_size)
+        # Cover every candidate edge with at least one clique-batch so no pair
+        # is silently dropped (unlike the disjoint pivot partition).
+        components = _clique_edge_cover(filtered, batch_size)
         agent_logger.info(
             "[dedup] %d candidate(s) → %d group(s) (batch_size=%d)",
             len(filtered), len(components), batch_size,
@@ -496,13 +526,13 @@ async def _dedup_group(
         [{"role": "system", "content": _prompt("dedup_system.txt")},
          {"role": "user",   "content": prompt}],
         tools=None,
+        priority=15,
     ):
         if isinstance(event, TextDelta):
             response_text += event.text
 
-    short_ids = "/".join(e["e.uuid"][:8] for e in entities)
-    if response_text:
-        agent_logger.info("[dedup group/%s] %s", short_ids, response_text)
+    names_label = "/".join(e["e.name"] for e in entities)
+    short_ids   = "/".join(e["e.uuid"][:8] for e in entities)
 
     try:
         merge_ops = _parse_dedup_response(response_text)
@@ -511,7 +541,11 @@ async def _dedup_group(
             "[memory/librarian] dedup: could not parse group response (%s): %s",
             short_ids, response_text[:200],
         )
+        agent_logger.warning("[dedup group/%s] unparseable response: %s", names_label, response_text[:200])
         return []
+
+    if not merge_ops:
+        agent_logger.info("[dedup group/%s] no duplicates — all %d distinct", names_label, len(entities))
 
     # Validate and apply each merge op
     merged_uuids: set[str] = set()
@@ -545,6 +579,10 @@ async def _dedup_group(
         for dup_uuid in duplicate_uuids:
             ea = next(e for e in entities if e["e.uuid"] == canonical_uuid)
             eb = next(e for e in entities if e["e.uuid"] == dup_uuid)
+            agent_logger.info(
+                "[dedup group/%s] %s: '%s' absorbs '%s'",
+                names_label, verdict, ea["e.name"], eb["e.name"],
+            )
             await _apply_verdict(ea, eb, verdict, canonical_uuid, merged_desc)
 
     # All pairs NOT involved in a merge op are implicitly distinct

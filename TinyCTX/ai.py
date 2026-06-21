@@ -6,9 +6,12 @@ Imports only aiohttp and stdlib. No internal project imports.
 
 from __future__ import annotations
 
+import asyncio
+import heapq
+import itertools
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import AsyncIterator, Any
 import aiohttp
 from tenacity import (
@@ -21,6 +24,122 @@ from tenacity import (
 from TinyCTX.config import ModelConfig
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Priority queue — process-wide admission control for outbound LLM/embedding
+# requests. All callers go through LLM.stream() / Embedder.embed() /
+# Embedder.embed_one(), passing an optional `priority` (lower runs first,
+# ties are FIFO). The queue itself is module-level state, not an object
+# passed around — configure_parallel() is the only external touchpoint.
+# ---------------------------------------------------------------------------
+
+_queue_heap: list = []          # heap of _QueueItem
+_queue_seq = itertools.count()
+_queue_lock_cond: asyncio.Condition | None = None   # created lazily, needs a running loop
+_queue_workers: list[asyncio.Task] = []
+_queue_parallel = 3              # overwritten by configure_parallel()
+
+
+def configure_parallel(n: int) -> None:
+    """
+    Set the number of concurrent in-flight LLM/embedding requests. Called
+    once at startup after Config is loaded (config.yaml's `parallel:` key).
+    Safe to call before the first request — workers spin up lazily.
+    """
+    global _queue_parallel
+    _queue_parallel = max(1, n)
+
+
+@dataclass(order=True)
+class _QueueItem:
+    priority:  int
+    seq:       int
+    is_stream: bool                    = field(compare=False, default=False)
+    fut:       "asyncio.Future | None" = field(compare=False, default=None)
+    coro_fn:   Any                     = field(compare=False, default=None)
+    gen_fn:    Any                     = field(compare=False, default=None)
+    out_queue: "asyncio.Queue | None"  = field(compare=False, default=None)
+
+
+_STREAM_DONE = object()  # sentinel — distinguishes "generator finished" from any real event
+
+
+async def _ensure_workers() -> None:
+    """Lazily spin up worker tasks on first use. No caller needs to know this exists."""
+    global _queue_lock_cond
+    if _queue_lock_cond is None:
+        _queue_lock_cond = asyncio.Condition()
+    while len(_queue_workers) < _queue_parallel:
+        _queue_workers.append(asyncio.create_task(_queue_worker(len(_queue_workers))))
+
+
+async def _queue_worker(worker_id: int) -> None:
+    """
+    Pops the highest-priority item and runs it to completion before looking
+    at the heap again — this is what makes `parallel` a real concurrency
+    cap. For a one-shot call (embeddings), "running it" means awaiting a
+    coroutine. For a stream, "running it" means draining the real async
+    generator and forwarding each item live as it's produced — nothing is
+    buffered or replayed, the worker is just busy for the generator's
+    entire lifetime.
+    """
+    while True:
+        async with _queue_lock_cond:
+            while not _queue_heap:
+                await _queue_lock_cond.wait()
+            item = heapq.heappop(_queue_heap)
+        try:
+            if item.is_stream:
+                async for event in item.gen_fn():
+                    await item.out_queue.put(event)
+                await item.out_queue.put(_STREAM_DONE)
+            else:
+                result = await item.coro_fn()
+                if not item.fut.done():
+                    item.fut.set_result(result)
+        except Exception as e:
+            logger.exception("[ai] queue worker %d request failed", worker_id)
+            if item.is_stream:
+                await item.out_queue.put(e)
+            elif not item.fut.done():
+                item.fut.set_exception(e)
+
+
+async def _enqueue(priority: int, coro_fn) -> Any:
+    """One-shot call (embeddings). Submit a zero-arg coroutine factory, await its result."""
+    await _ensure_workers()
+    fut = asyncio.get_event_loop().create_future()
+    item = _QueueItem(priority=priority, seq=next(_queue_seq), is_stream=False, fut=fut, coro_fn=coro_fn)
+    async with _queue_lock_cond:
+        heapq.heappush(_queue_heap, item)
+        _queue_lock_cond.notify()
+    return await fut
+
+
+async def _enqueue_stream(priority: int, gen_fn) -> AsyncIterator[Any]:
+    """
+    Streaming call. `gen_fn` is a zero-arg callable returning an async
+    generator (e.g. `lambda: self._stream_with_retry(messages, tools)`).
+    The generator is NOT started until a worker admits this item — that's
+    the entire mechanism for "don't emit anything while queued." Once
+    admitted, the worker drains it and forwards each yielded item through
+    `out_queue` immediately, so the caller sees live events, not a replay.
+    """
+    await _ensure_workers()
+    out_queue: asyncio.Queue = asyncio.Queue()
+    item = _QueueItem(priority=priority, seq=next(_queue_seq), is_stream=True, gen_fn=gen_fn, out_queue=out_queue)
+    async with _queue_lock_cond:
+        heapq.heappush(_queue_heap, item)
+        _queue_lock_cond.notify()
+
+    while True:
+        event = await out_queue.get()
+        if event is _STREAM_DONE:
+            return
+        if isinstance(event, Exception):
+            raise event
+        yield event
 
 
 # ---------------------------------------------------------------------------
@@ -129,15 +248,21 @@ class LLM:
         self,
         messages: list[dict],
         tools:    list[dict] | None = None,
+        priority: int = 10,
     ) -> AsyncIterator[LLMEvent]:
         """
         Stream a completion. Yields TextDelta, ToolCallAssembled, or LLMError.
         Retries on transient connection errors (up to 3 attempts, exponential backoff).
         Tool call argument chunks are assembled before yielding — callers
         always receive complete, parseable args dicts.
+
+        `priority` controls admission order when multiple requests are in
+        flight at once (lower runs first, ties are FIFO). A queued request
+        emits nothing until a worker admits it — once admitted, it streams
+        live exactly as before, with no buffering or replay.
         """
         try:
-            async for event in self._stream_with_retry(messages, tools):
+            async for event in _enqueue_stream(priority, lambda: self._stream_with_retry(messages, tools)):
                 yield event
         except aiohttp.ClientConnectionError as e:
             yield LLMError(f"Connection failed after retries: {e}")
@@ -318,25 +443,31 @@ class Embedder:
             timeout=timeout,
         )
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    async def embed(self, texts: list[str], priority: int = 10) -> list[list[float]]:
         """
         Embed a list of strings. Returns one float vector per input text,
         in the same order as the input. Batches automatically.
+
+        `priority` controls admission order when multiple requests are in
+        flight at once (lower runs first, ties are FIFO).
 
         Raises RuntimeError on API error.
         """
         if not texts:
             return []
 
-        results: list[list[float]] = []
-        for i in range(0, len(texts), self.batch_size):
-            batch = texts[i : i + self.batch_size]
-            results.extend(await self._call(batch))
-        return results
+        async def _run():
+            results: list[list[float]] = []
+            for i in range(0, len(texts), self.batch_size):
+                batch = texts[i : i + self.batch_size]
+                results.extend(await self._call(batch))
+            return results
 
-    async def embed_one(self, text: str) -> list[float]:
+        return await _enqueue(priority, _run)
+
+    async def embed_one(self, text: str, priority: int = 10) -> list[float]:
         """Convenience wrapper — embed a single string."""
-        vecs = await self.embed([text])
+        vecs = await self.embed([text], priority=priority)
         return vecs[0]
 
     async def _call(self, texts: list[str]) -> list[list[float]]:

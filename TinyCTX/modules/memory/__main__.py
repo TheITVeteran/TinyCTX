@@ -80,31 +80,6 @@ _memory_block_cache: dict[str, str | None] = {"value": None}
 
 
 # ---------------------------------------------------------------------------
-# _YieldingLLM — pauses background LLM calls while user cycles are active
-# ---------------------------------------------------------------------------
-
-class _YieldingLLM:
-    """
-    Thin wrapper around LLM that waits for user cycles to finish before
-    each streaming request. Prevents background consolidation from
-    competing with real messages mid-generation.
-    """
-
-    def __init__(self, llm, is_busy_fn):
-        self._llm = llm
-        self._is_busy = is_busy_fn  # callable() -> bool
-
-    async def stream(self, messages, tools=None):
-        while self._is_busy():
-            await asyncio.sleep(1)
-        async for event in self._llm.stream(messages, tools):
-            yield event
-
-    def __getattr__(self, name):
-        return getattr(self._llm, name)
-
-
-# ---------------------------------------------------------------------------
 # LibrarianRunner — in-process background task
 # ---------------------------------------------------------------------------
 
@@ -143,8 +118,11 @@ class LibrarianRunner:
         # Falls back to the regular search embedder when None.
         self._graph_embedder = graph_embedder if graph_embedder is not None else embedder
 
-        # Wrap the LLM so background calls pause while user cycles are active.
-        self._llm = _YieldingLLM(llm, self._user_cycles_active)
+        # Background calls go through the same ai.py priority queue as the
+        # user-facing cycle (see librarian_agents.py / dedup_agents.py call
+        # sites, priority=15) — that's what makes background work wait its
+        # turn now, so no wrapper is needed here.
+        self._llm = llm
 
         # Dedicated file logger for all librarian agent text output
         self.agent_logger = logging.getLogger("memory.librarian.agent")
@@ -166,6 +144,7 @@ class LibrarianRunner:
             "last_poll_ts":  0.0,
             "last_dedup_ts": 0.0,
             "dedup_running": False,
+            "last_decay_ts": 0.0,
         }
         self._active_tasks: set[asyncio.Task] = set()
 
@@ -231,6 +210,7 @@ class LibrarianRunner:
             nodes_to_text,
         )
         from TinyCTX.modules.memory.dedup_agents import run_edge_dedup
+        from TinyCTX.modules.memory.decay import run_decay_sweep
 
         # Reap finished tasks
         done = {t for t in self._active_tasks if t.done()}
@@ -364,6 +344,28 @@ class LibrarianRunner:
                 self._active_tasks.add(t)
             else:
                 self._state["dedup_running"] = False
+
+        # Decay sweep on schedule — skip when user cycles are active.
+        # Hard-deletes non-pinned entities scoring below decay_threshold based
+        # on priority, distance to nearest pinned entity, edge count, mention
+        # count, and read/update recency. Runs fully automatically.
+        decay_enabled  = bool(self._cfg.get("decay_enabled", True))
+        decay_interval = float(self._cfg.get("decay_interval_hours", 24)) * 3600
+        if (
+            decay_enabled
+            and not self._user_cycles_active()
+            and (now - self._state["last_decay_ts"]) >= decay_interval
+            and len(self._active_tasks) < max_concurrent
+        ):
+            self._state["last_decay_ts"] = now
+
+            t = asyncio.create_task(
+                run_decay_sweep(
+                    self._cfg, self._write_conn, self._write_lock, self.agent_logger,
+                )
+            )
+            t.add_done_callback(self._checkpoint_callback)
+            self._active_tasks.add(t)
 
 
 # ---------------------------------------------------------------------------

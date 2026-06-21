@@ -228,7 +228,7 @@ class AgentCycle:
             calls: list[ToolCall] = []
             error: str | None = None
 
-            async for ev in llm.stream(messages, tools=tools):
+            async for ev in llm.stream(messages, tools=tools, priority=0):
                 if abort_event.is_set():
                     yield ([], [], "aborted")
                     return

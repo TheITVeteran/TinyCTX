@@ -351,7 +351,7 @@ async def kg_search(query: str, top_k: int = 3, semantic: bool = True) -> str:
     vec_scores: dict[str, int] = {}  # uid -> rank (1-based)
     if semantic and _embedder is not None:
         try:
-            query_vec = await _embedder.embed_one(_query_template.format(text=query))
+            query_vec = await _embedder.embed_one(_query_template.format(text=query), priority=5)
             all_embs  = _graph_db.all_entities_with_embeddings()
             vec_hits  = top_k_cosine(query_vec, all_embs, len(all_embs))
             for rank, (uid, score) in enumerate(vec_hits, start=1):
@@ -382,6 +382,7 @@ async def kg_search(query: str, top_k: int = 3, semantic: bool = True) -> str:
         return "No matching entities found."
 
     _graph_db.bump_mention_count(uids)
+    _graph_db.bump_last_read(uids, now_ts())
 
     lines = []
     for uid in uids:

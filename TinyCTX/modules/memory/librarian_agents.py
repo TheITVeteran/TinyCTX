@@ -192,7 +192,7 @@ async def _agent_loop(
         text_chunks: list[str] = []
         tool_calls:  list[dict] = []
 
-        async for event in llm.stream(messages, tools=tool_defs):
+        async for event in llm.stream(messages, tools=tool_defs, priority=15):
             if isinstance(event, TextDelta):
                 text_chunks.append(event.text)
             elif isinstance(event, ToolCallAssembled):
