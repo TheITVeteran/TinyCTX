@@ -305,6 +305,29 @@ async def run_dedup_cycle(
 
         graph_embed_model_name = getattr(embedder, "model", "")
 
+        # Name-based candidates: same name (case-insensitive). Computed before
+        # the stale-embedding check below, since an exact name collision is a
+        # duplicate signal on its own and shouldn't depend on whether anyone's
+        # embedding happens to be out of date.
+        pairs_seen: set[frozenset] = set()
+        candidates: list[tuple[dict, dict, float]] = []
+
+        by_name: dict[str, list[dict]] = {}
+        for e in entities:
+            key = (e["e.name"] or "").strip().lower()
+            if key:
+                by_name.setdefault(key, []).append(e)
+        for group in by_name.values():
+            if len(group) < 2:
+                continue
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    ea, eb = group[i], group[j]
+                    pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
+                    if pair_key not in pairs_seen:
+                        pairs_seen.add(pair_key)
+                        candidates.append((ea, eb, 1.0))
+
         stale: list[dict] = []
         for e in entities:
             uid   = e["e.uuid"]
@@ -349,50 +372,29 @@ async def run_dedup_cycle(
                     e["e.graph_embedding"]     = vec
                     e["e.graph_embed_model"]   = graph_embed_model_name
                     e["e.graph_embed_hash"]    = h
+
+            # Build embedding-similarity candidates (stale × all, deduplicated)
+            for stale_e in stale:
+                emb_a = stale_e.get("e.graph_embedding") or stale_e.get("e.embedding") or []
+                if not emb_a:
+                    continue
+                uid_a = stale_e["e.uuid"]
+                for eb in entities:
+                    uid_b = eb["e.uuid"]
+                    if uid_a == uid_b:
+                        continue
+                    pair_key = frozenset([uid_a, uid_b])
+                    if pair_key in pairs_seen:
+                        continue
+                    pairs_seen.add(pair_key)
+                    emb_b = eb.get("e.graph_embedding") or eb.get("e.embedding") or []
+                    if not emb_b:
+                        continue
+                    score = cosine_similarity(emb_a, emb_b)
+                    if score >= threshold:
+                        candidates.append((stale_e, eb, score))
         else:
-            logger.debug("[memory/librarian] dedup: all embeddings current, no pairs to re-evaluate")
-            return
-
-        # Build candidate pairs (stale × all, deduplicated)
-        pairs_seen: set[frozenset] = set()
-        candidates: list[tuple[dict, dict, float]] = []
-
-        for stale_e in stale:
-            emb_a = stale_e.get("e.graph_embedding") or stale_e.get("e.embedding") or []
-            if not emb_a:
-                continue
-            uid_a = stale_e["e.uuid"]
-            for eb in entities:
-                uid_b = eb["e.uuid"]
-                if uid_a == uid_b:
-                    continue
-                pair_key = frozenset([uid_a, uid_b])
-                if pair_key in pairs_seen:
-                    continue
-                pairs_seen.add(pair_key)
-                emb_b = eb.get("e.graph_embedding") or eb.get("e.embedding") or []
-                if not emb_b:
-                    continue
-                score = cosine_similarity(emb_a, emb_b)
-                if score >= threshold:
-                    candidates.append((stale_e, eb, score))
-
-        # Name-based candidates: same name (case-insensitive)
-        by_name: dict[str, list[dict]] = {}
-        for e in entities:
-            key = (e["e.name"] or "").strip().lower()
-            if key:
-                by_name.setdefault(key, []).append(e)
-        for group in by_name.values():
-            if len(group) < 2:
-                continue
-            for i in range(len(group)):
-                for j in range(i + 1, len(group)):
-                    ea, eb = group[i], group[j]
-                    pair_key = frozenset([ea["e.uuid"], eb["e.uuid"]])
-                    if pair_key not in pairs_seen:
-                        pairs_seen.add(pair_key)
-                        candidates.append((ea, eb, 1.0))
+            logger.debug("[memory/librarian] dedup: all embeddings current — name-collision candidates only")
 
         if not candidates:
             logger.debug("[memory/librarian] dedup: no candidate pairs above threshold %.2f", threshold)
