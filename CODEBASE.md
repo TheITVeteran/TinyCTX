@@ -194,6 +194,8 @@ Every `LLM.stream()` / `Embedder.embed()` / `embed_one()` call is admission-cont
 - `get_tool_definitions(caller_level, minimal_tokens)` — returns OpenAI-format tool definitions for enabled tools the caller has permission to use
 - `execute_tool_call(tool_call, caller_level)` — dispatches sync or async functions; sync functions run in a thread-pool executor
 
+**Known schema generation caveat:** `_python_type_to_json_schema` handles `from __future__ import annotations` by resolving bare stringified type names (`'list'`, `'bool'`, etc.) back to their builtins. Complex generic strings like `'list[str]'` are not parseable this way and fall back to `{"type": "string"}` — a wrong but non-crashing result. Bare `list` (resolved to the `list` builtin) is handled by the `origin is list or annotation is list` branch and always emits `{"type": "array", "items": {"type": "string"}}` to avoid producing a schema without `items`, which crashes llama.cpp/llama-swap's Jinja2 tool template.
+
 Permission levels: 0–100. Each tool has a `min_permission`. `minimal_tokens=True` hides tools the caller can't use.
 
 ---
