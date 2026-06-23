@@ -279,6 +279,26 @@ class LLM:
         messages: list[dict],
         tools:    list[dict] | None = None,
     ) -> AsyncIterator[LLMEvent]:
+        # Expand image tool results: a tool turn whose content is a list
+        # containing an image_url block is not valid as-is (OpenAI-compat APIs
+        # don't support image content in tool messages). Split it into a plain
+        # text tool result + a synthetic user turn with the image_url block.
+        expanded: list[dict] = []
+        for msg in messages:
+            if (
+                msg.get("role") == "tool"
+                and isinstance(msg.get("content"), list)
+                and any(b.get("type") == "image_url" for b in msg["content"])
+            ):
+                image_blocks = [b for b in msg["content"] if b.get("type") == "image_url"]
+                text_blocks  = [b for b in msg["content"] if b.get("type") != "image_url"]
+                text_content = text_blocks[0]["text"] if text_blocks else ""
+                expanded.append({**msg, "content": text_content})
+                expanded.append({"role": "user", "content": image_blocks})
+            else:
+                expanded.append(msg)
+        messages = expanded
+
         # --- cache_prompts: inject ephemeral cache_control on last system message ---
         if self.cache_prompts:
             messages = _inject_cache_control(messages)
