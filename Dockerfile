@@ -25,20 +25,11 @@ WORKDIR /app
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install playwright && playwright install chromium
 
-# --- python deps -----------------------------------------------------------
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --upgrade pip && \
-    pip install \
-        PyYAML aiohttp pyfiglet rich questionary requests mcp numpy \
-        tiktoken structlog tenacity ddgs pdfplumber ladybug \
-        python-docx Pillow sympy "antlr4-python3-runtime==4.13.2" jinja2 \
-        platformdirs croniter "discord.py" matrix-nio onnxruntime
-
 # --- app source ------------------------------------------------------------
 COPY TinyCTX/ ./TinyCTX/
 COPY pyproject.toml ./
 
-RUN pip install --no-cache-dir --no-deps -e .
+RUN pip install --no-cache-dir -e .
 
 # --- config dir (users.db lives here, outside the workspace mount) --------
 RUN mkdir -p /etc/tinyctx && chown tinyctx:tinyctx /etc/tinyctx
