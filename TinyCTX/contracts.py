@@ -30,12 +30,13 @@ import uuid
 # ---------------------------------------------------------------------------
 
 class Platform(str, Enum):
-    CLI     = "cli"
-    DISCORD = "discord"
-    MATRIX  = "matrix"
-    CRON    = "cron"   # internal platform for scheduled cron jobs
-    API     = "api"    # HTTP/SSE API bridge
-    SYSTEM  = "system" # internal platform for module/runtime-generated messages
+    CLI      = "cli"
+    DISCORD  = "discord"
+    MATRIX   = "matrix"
+    TELEGRAM = "telegram"
+    CRON     = "cron"   # internal platform for scheduled cron jobs
+    API      = "api"    # HTTP/SSE API bridge
+    SYSTEM   = "system" # internal platform for module/runtime-generated messages
 
 
 class ContentType(str, Enum):
