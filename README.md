@@ -275,6 +275,21 @@ bridges:
 
 Required bot intents: **Message Content**, **Server Members**. Required permissions: Read Messages, Send Messages, Read Message History.
 
+### Telegram
+
+```yaml
+bridges:
+  telegram:
+    enabled: true
+    options:
+      token_env: TELEGRAM_BOT_TOKEN   # env var holding the @BotFather token
+      allowed_users: [123456789]      # Telegram user IDs; empty = open to all
+      max_reply_length: 4096          # Telegram's hard per-message limit
+      mention_aliases: ["eve"]        # extra names the bot answers to in groups
+```
+
+Create a bot with [@BotFather](https://t.me/BotFather) and export the token as `TELEGRAM_BOT_TOKEN`. Run the bridge like the others: `python -m TinyCTX.bridges.telegram`. In groups the bot answers to its @username, its BotFather display name, a reply to one of its own messages, and any `mention_aliases`; bare-name matching requires privacy mode **disabled** in @BotFather (`/setprivacy` → Disable, then re-add the bot to the group).
+
 ### Matrix
 
 ```yaml
