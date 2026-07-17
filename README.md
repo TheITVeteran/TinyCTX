@@ -31,7 +31,7 @@ A context-efficient agentic assistant framework. Connect it to your LLM, configu
 > - **`prefix_required: true`** � in group channels, only respond when @mentioned or prefixed. This reduces noise but is not a security boundary on its own.
 > - **Gateway `api_key`** � always set a strong, random key if the gateway is enabled. Never expose the gateway port to the public internet without authentication.
 >
-> The filesystem module sandboxes file operations to the workspace directory and maintains a shell command blacklist, but these are last-resort guardrails, not a substitute for access control.
+> The filesystem module sandboxes `write_file`/`edit_file` to the workspace directory only. `view`/`grep`/`glob_search` can additionally see any directory listed in `filesystem.read_only_paths` in config.yaml (read-only, never writable — e.g. `/app` for the agent's own source code in the container). Nothing outside workspace + that whitelist is reachable at all. The module also maintains a shell command blacklist, but these are last-resort guardrails, not a substitute for access control.
 >
 > **The right mental model: treat TinyCTX like an SSH session. Only give access to people you'd give a shell to.**
 
@@ -48,33 +48,46 @@ python -m TinyCTX onboard
 
 This starts the interactive configuration wizard. It will walk you through choosing a provider, configuring your workspace, and optionally setting up bridges.
 
-## Workspace
+## Instance Directory
 
-The workspace is a directory on disk where the agent keeps its persistent state. Default: `~/.tinyctx`. Change it in `config.yaml` or during onboarding.
+An *instance* is a self-contained directory holding one agent's config, workspace, and internal data — everything an agent needs lives in one place, so running multiple agents is just running multiple instance directories.
 
-Layout:
+Every `tinyctx` command resolves the instance directory the same way:
+
+1. `--dir PATH`, if given
+2. The nearest ancestor of your current directory that's literally named `.tinyctx` (so running from inside `<instance>/workspace/skills/foo` still resolves correctly)
+3. A `.tinyctx/` child of your current directory
+4. Fallback: `~/.tinyctx`
 
 ```
-~/.tinyctx/
-+-- agent.db          # Branch-backed conversation tree (SQLite WAL)
-+-- cursors/          # Per-bridge/session cursors (CLI resume uses this)
-+-- SOUL.md           # Agent personality � loaded first, every turn
-+-- AGENTS.md         # Sub-agent or persona definitions
-+-- EM.md             # Equipment manifest (optional; templated with OS/date/paths)
-+-- HEARTBEAT.md      # Heartbeat instructions (read by agent each heartbeat turn)
-+-- memory/           # Semantic search corpus � any *.md files here are searchable
-�   +-- graph.lbug    # LadybugDB knowledge graph (memory module)
-�   +-- librarian.log # Librarian logging
-+-- downloads/        # Files and images sent by users via bridges
-+-- CRON.json         # Scheduled jobs (cron module)
-+-- skills/           # Skill folders
-    +-- mytool/
-        +-- SKILL.md
+<instance>/
++-- config.yaml           # loaded from here by default
++-- workspace/            # agent-authored content — visible to the agent's own filesystem tools
+│   +-- SOUL.md           # Agent personality — loaded first, every turn
+│   +-- AGENTS.md         # Sub-agent or persona definitions
+│   +-- EM.md             # Equipment manifest (optional; templated with OS/date/paths)
+│   +-- HEARTBEAT.md      # Heartbeat instructions (read by agent each heartbeat turn)
+│   +-- rag/, memory/*.md # Semantic search corpus — any *.md files here are searchable
+│   +-- downloads/        # Files and images sent by users via bridges
+│   +-- CRON.json         # Scheduled jobs (cron module)
+│   +-- skills/
+│       +-- mytool/
+│           +-- SKILL.md
++-- data/                 # TinyCTX-internal state — NOT visible to the agent's own filesystem tools
+    +-- agent.db          # Branch-backed conversation tree (SQLite WAL)
+    +-- users.db          # User registry
+    +-- cursors/          # Per-bridge/session cursors (CLI resume uses this)
+    +-- memory/
+        +-- graph.lbug    # LadybugDB knowledge graph (memory module)
+        +-- librarian.log # Librarian logging
+        +-- dedup_cache.db
 ```
 
-Edit these files any time � they are re-read every turn, no restart needed.
+`workspace.path` and `data.path` both default to `<instance>/workspace` and `<instance>/data` — relative to wherever `config.yaml` itself lives — so a fresh config.yaml doesn't need to state either explicitly. Override only if you want something non-standard.
 
-TinyCTX does not keep chat state only in RAM. Conversations are stored in `agent.db` as a branch tree, and the CLI bridge restores the visible transcript from the saved cursor on startup.
+Edit files under `workspace/` any time — they are re-read every turn, no restart needed. Files under `data/` are internal state the agent's own tools can't reach; edit them only if you know what you're doing.
+
+TinyCTX does not keep chat state only in RAM. Conversations are stored in `data/agent.db` as a branch tree, and the CLI bridge restores the visible transcript from the saved cursor on startup.
 
 ---
 
@@ -125,11 +138,11 @@ The agent can also call `rag_search` explicitly to look things up on demand. See
 
 ### Knowledge Graph (memory module)
 
-The `memory` module adds a property-graph knowledge store backed by **LadybugDB**. A background librarian process walks unvisited conversation nodes (tracked with DB flags), extracts entities and relationships via sub-agents, and writes them to `memory/graph.lbug`. The main agent reads the graph via `kg_search`, `kg_traverse`, and `call_librarian` tools. Pinned entities are injected into the system prompt automatically.
+The `memory` module adds a property-graph knowledge store backed by **LadybugDB**. A background librarian process walks unvisited conversation nodes (tracked with DB flags), extracts entities and relationships via sub-agents, and writes them to `data/memory/graph.lbug`. The main agent reads the graph via `kg_search`, `kg_traverse`, and `call_librarian` tools. Pinned entities are injected into the system prompt automatically.
 
 ```yaml
 # memory module (all optional � these are the defaults)
-# graph_path:             memory/graph.lbug
+# graph_path:             data/memory/graph.lbug   # resolved relative to data.path, not workspace.path
 # trigger_interval_hours: 6
 # batch_size:             20
 # embedding_model:        ""    # empty = keyword-only graph search
@@ -141,7 +154,7 @@ The `memory` module adds a property-graph knowledge store backed by **LadybugDB*
 
 ## User Permissions
 
-Every inbound message is associated with a **User** � a TinyCTX-internal account that may have identities on multiple platforms (Discord, Matrix, CLI, �). Users are created automatically on first contact and stored in `~/.config/tinyctx/users.db`.
+Every inbound message is associated with a **User** � a TinyCTX-internal account that may have identities on multiple platforms (Discord, Matrix, CLI, �). Users are created automatically on first contact and stored in `<instance>/data/users.db`.
 
 Each user has a **permission level** (0�100). Tools declare a `min_permission` threshold; a caller cannot execute tools above their level. New users start at `default_permission` (default: 25).
 
@@ -236,11 +249,14 @@ Full annotated config: see `example.config.yaml`. Key top-level keys:
 |-----|---------|---------|
 | `context` | `16384` | Token budget (recommend `32768`) |
 | `max_tool_cycles` | `10` | Max tool-call iterations per turn |
-| `workspace.path` | `~/.tinyctx` | Workspace directory |
+| `workspace.path` | `<instance>/workspace` | Agent-visible working directory |
+| `data.path` | `<instance>/data` | Internal state (agent.db, users.db, memory graph, cursors) — not visible to the agent's own filesystem tools |
+| `filesystem.read_only_paths` | `[]` | Extra directories `view`/`grep`/`glob_search` can see (never write to) — e.g. `/app` |
 | `llm.primary` | � | Primary model name (must be `kind: chat`) |
 | `llm.fallback` | `[]` | Fallback model names, tried in order |
 | `permissions.minimal_tokens` | `true` | Hide tools the caller cannot use |
 | `gateway.api_key` | � | Auth token for the HTTP gateway |
+| `gateway.port` | `8085` | Overridable per-instance via `TINYCTX_PORT` env (set automatically by `tinyctx start`) |
 
 Models are defined under `models:` with `kind: chat` (default) or `kind: embedding`. Embedding models are never used for LLM routing.
 
@@ -327,9 +343,11 @@ gateway:
 ## CLI Commands
 
 ```bash
-tinyctx onboard    # first-run setup wizard
-tinyctx start      # daemonise the server
-tinyctx stop       # stop the daemon
-tinyctx status     # check if running
-tinyctx launch cli # attach an interactive terminal session
+tinyctx onboard      # first-run setup wizard for the resolved instance
+tinyctx start        # start the stack (docker compose) for the resolved instance
+tinyctx stop         # stop it
+tinyctx status       # check if running
+tinyctx launch cli   # attach an interactive terminal session
 ```
+
+All five accept `--dir PATH` to target a specific `.tinyctx` instance directory instead of relying on autodetection — this is how you run more than one agent on the same machine: give each its own instance directory (e.g. `tinyctx onboard --dir ~/agent-b/.tinyctx`), then use `--dir` (or `cd` into it) for every subsequent command against that instance.
