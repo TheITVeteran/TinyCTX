@@ -71,7 +71,8 @@ def run(args: argparse.Namespace) -> None:
         print(f"error: unknown launch target '{target}'", file=sys.stderr)
         sys.exit(1)
 
-    config_path = Path(getattr(args, "config", None) or config_path_for(resolve_instance_dir(getattr(args, "dir", None)))).resolve()
+    instance_dir = resolve_instance_dir(getattr(args, "dir", None))
+    config_path = Path(getattr(args, "config", None) or config_path_for(instance_dir)).resolve()
     if not config_path.exists():
         print(f"error: no config.yaml found at {config_path}.", file=sys.stderr)
         print("  Run 'TinyCTX onboard' to set up TinyCTX, or manually create a config.yaml.", file=sys.stderr)
@@ -165,6 +166,6 @@ def run(args: argparse.Namespace) -> None:
     import asyncio
     from TinyCTX.bridges.cli.__main__ import run_detached
     try:
-        asyncio.run(run_detached(gateway_url, api_key, options, username=username))
+        asyncio.run(run_detached(gateway_url, api_key, options, username=username, instance_dir=instance_dir))
     except KeyboardInterrupt:
         pass

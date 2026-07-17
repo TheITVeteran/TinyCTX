@@ -24,6 +24,13 @@ TinyCTX/
 │
 ├── config/             Config loading (YAML → dataclasses)
 ├── users/              UserStore + User/PlatformIdentity models (SQLite)
+├── commands/
+│   ├── _instance.py     Shared instance-directory resolution (--dir / CWD .tinyctx / ~/.tinyctx)
+│   ├── launch.py        tinyctx launch — attaches a bridge client
+│   ├── start.py         tinyctx start  — docker compose up for the resolved instance
+│   ├── stop.py          tinyctx stop   — docker compose down for the resolved instance
+│   ├── status.py        tinyctx status
+│   └── onboard.py       tinyctx onboard — delegates to onboard/
 ├── utils/
 │   ├── tool_handler.py  ToolCallHandler — register/enable/execute tools
 │   ├── commands.py      CommandRegistry — slash-command dispatch for bridges
@@ -35,13 +42,6 @@ TinyCTX/
 │   └── discord/             Discord bridge (discord.py) — see below
 │
 ├── gateway/__main__.py      HTTP/SSE gateway (aiohttp, /v1/chat endpoint)
-│
-├── commands/
-│   ├── launch.py   tinyctx launch — attaches a bridge client
-│   ├── start.py    tinyctx start  — daemonises main.py
-│   ├── stop.py     tinyctx stop
-│   ├── status.py   tinyctx status
-│   └── onboard.py  tinyctx onboard — delegates to onboard/
 │
 ├── onboard/            Interactive first-run setup wizard
 │   ├── __main__.py     Orchestrates setup steps
@@ -122,7 +122,7 @@ All cross-layer communication uses these frozen dataclasses/enums. No business l
 
 ## Database (`db.py`)
 
-SQLite WAL-mode database at `workspace/agent.db`. All conversation state is a **tree of nodes** — every message is a node with a `parent_id`, forming branches.
+SQLite WAL-mode database at `<instance>/data/agent.db` (see Instance Layout below — NOT workspace/, so the agent's own filesystem tools never see it). All conversation state is a **tree of nodes** — every message is a node with a `parent_id`, forming branches.
 
 **Key columns:** `id, parent_id, role, content, created_at, tool_calls, tool_call_id, author_id, attachment_paths, state_delta, flags`
 
@@ -216,7 +216,7 @@ Modules that only need per-cycle wiring skip `register_runtime`. Modules that on
 
 `User` — TinyCTX-internal user with a unique `username` (auto-generated if needed), `permission_level` (0–100), a list of `PlatformIdentity` objects (one per platform account), and a freeform `meta` dict.
 
-`UserStore` — SQLite-backed (`~/.config/tinyctx/users.db` or `$TINYCTX_CONFIG_DIR/users.db`). Hot path: `resolve_user(platform, user_id, username, display_name)` — lookup by `(platform, user_id)`, create if not found, update identity if changed. In-memory LRU cache on both `(platform, user_id)` and `username`.
+`UserStore` — SQLite-backed. Takes a `data_dir` (an instance's `data/` path) explicitly from `Runtime`; falls back to `TINYCTX_DATA_PATH` env, then platformdirs, only when constructed without one (legacy/standalone callers). Hot path: `resolve_user(platform, user_id, username, display_name)` — lookup by `(platform, user_id)`, create if not found, update identity if changed. In-memory LRU cache on both `(platform, user_id)` and `username`.
 
 Slash commands registered by `Runtime`:
 - `/user grant <username> <level>` — requires caller level 100
@@ -250,7 +250,7 @@ Slash commands registered by `Runtime`:
 
 ### CLI (`bridges/cli/__main__.py`)
 - Sets `MANUAL_LAUNCH = True` — only starts via `tinyctx launch cli`
-- Rich TUI with persistent session restore (reads cursor from `workspace/cursors/`)
+- Rich TUI with persistent session restore (cursor file at `<instance>/data/cursors/cli`, resolved via the `instance_dir` passed in by `commands/launch.py`)
 - Supports paste refs, slash commands, copy helpers
 - Provider presets for OpenAI, OpenRouter, Ollama, LM Studio, llama.cpp, custom
 - `agent_name` option: set `agent_name: "Aria"` under `bridges.cli.options` to stamp assistant nodes with a custom name (forwarded in every message payload to the gateway)
@@ -271,7 +271,8 @@ bridges/discord/
                 CommandRegistry; handle_reset_interaction(),
                 handle_shutdown_interaction(), handle_command_interaction()
   cursors.py    CursorStore — persists discord.json + discord_msg_nodes.json
-                under workspace/cursors/; make_session_node() helper
+                under data/cursors/ (bridge bookkeeping, not workspace/);
+                make_session_node() helper
   compat.py     CompatRules — hot-reloads compat.json, matches messages against
                 proxy-bot delay rules (e.g. Tupperbot)
   mentions.py   humanize_mentions() — <@id> → @username (inbound)
@@ -295,7 +296,7 @@ Key config options (under `bridges.discord.options`):
 Thread branching: when a thread is created inside a tracked channel, the bot forks a
 new DB branch from the channel turn that spawned it. Both evolve independently.
 Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
-`workspace/cursors/discord.json` so sessions survive restarts.
+`<instance>/data/cursors/discord.json` so sessions survive restarts.
 
 ### Gateway (`gateway/__main__.py`)
 - aiohttp HTTP server exposing `/v1/chat` (OpenAI-compat SSE)
@@ -310,7 +311,7 @@ Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
 
 ### `rag` — indexes `workspace/memory/*.md` files; auto-injects relevant chunks each turn (BM25 or embedding cosine similarity); provides `memory_search` tool; triggers background memory consolidation when context budget is near.
 
-### `memory` — LadybugDB property-graph knowledge store. A background "librarian" walks unvisited conversation nodes (tracked with DB flags), extracts entities/relationships via sub-agents, and writes to the graph. Main agent uses `kg_search` / `kg_traverse` / `call_librarian` tools. Pinned entities are injected into the system prompt. The librarian identifies the agent by reading `author_id` on assistant nodes (set from session state `agent_name`); this is how it knows which speaker is the agent vs the user in the conversation transcript. Conversation excerpts passed to the buffer agent are rendered by `nodes_to_text()` (`librarian_agents.py`) as `【author】: content` lines (fullwidth brackets, matching `context.py`'s convention); content is passed through `_sanitize_brackets()` first so it cannot forge this delimiter.
+### `memory` — LadybugDB property-graph knowledge store, stored at `<instance>/data/memory/graph.lbug` (not workspace/). A background "librarian" walks unvisited conversation nodes (tracked with DB flags), extracts entities/relationships via sub-agents, and writes to the graph. Main agent uses `kg_search` / `kg_traverse` / `call_librarian` tools. Pinned entities are injected into the system prompt. The librarian identifies the agent by reading `author_id` on assistant nodes (set from session state `agent_name`); this is how it knows which speaker is the agent vs the user in the conversation transcript. Conversation excerpts passed to the buffer agent are rendered by `nodes_to_text()` (`librarian_agents.py`) as `【author】: content` lines (fullwidth brackets, matching `context.py`'s convention); content is passed through `_sanitize_brackets()` first so it cannot forge this delimiter. Deduplication's `dedup_cache.db` also lives under `data/` (`dedup_agents.py`'s `run_dedup_cycle` takes `data_path`, not a workspace path).
 
 ### `heartbeat` — fires periodic agent turns on a background DB branch at a configured interval. Suppresses `HEARTBEAT_OK` replies. Slash command: `/heartbeat run`.
 
@@ -336,36 +337,48 @@ Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
 
 ## Config (`config/`)
 
-YAML-based. Loaded from `config.yaml` (or path specified via `--config`). Key top-level keys:
+YAML-based. Loaded from `<instance>/config.yaml` by default (see Instance Layout below), or a path passed explicitly via `--config`. Key top-level keys:
 
-- `workspace.path` — default `~/.tinyctx`
+- `workspace.path` — default `<instance>/workspace` (i.e. config.yaml's own directory + `/workspace`) — no longer needs stating explicitly in most configs
+- `data.path` — default `<instance>/data` — internal state (agent.db, users.db, memory graph, cursors); the agent's filesystem tools never see this directory
 - `models` — dict of named model configs (`kind`, `base_url`, `api_key_env`, `model`, `max_tokens`, `temperature`, `supports_vision`, `tokens_per_image`)
 - `llm.primary` / `llm.fallback` — model name(s); AgentCycle tries primary then fallbacks
 - `context` — token budget for context assembly
 - `max_tool_cycles` — max tool-call iterations per turn
 - `parallel` — max concurrent in-flight LLM/embedding requests across the whole process (default 3); see Priority queue under `ai.py` above
 - `bridges.<name>.enabled` / `bridges.<name>.options` — per-bridge config
-- `gateway.enabled` / `gateway.host` / `gateway.port` / `gateway.api_key`
+- `gateway.enabled` / `gateway.host` / `gateway.port` / `gateway.api_key` (`gateway.port` can be overridden per-instance via `TINYCTX_PORT` env, injected by `tinyctx start`)
 - `logging.level`
 - `permissions.minimal_tokens` — hide tools from LLM that the caller can't use
 
 ---
 
-## Workspace Layout (`~/.tinyctx/`)
+## Instance Layout (`commands/_instance.py`)
+
+An *instance* is a self-contained directory holding one agent's config, workspace, and internal data. Resolved by every CLI command the same way: `--dir` flag → nearest ancestor of CWD literally named `.tinyctx` → `.tinyctx/` child of CWD → `~/.tinyctx`. This is what makes multiple concurrent agents possible — each just needs its own instance directory.
 
 ```
-agent.db          Conversation tree (SQLite)
-cursors/          Per-bridge session cursors (CLI resume)
-SOUL.md           Agent personality (loaded every turn)
-AGENTS.md         Sub-agent/persona definitions
-memory/           Semantic search corpus (*.md files, subdirs OK)
-downloads/        Files/images sent by users via bridges
-CRON.json         Scheduled jobs
-HEARTBEAT.md      Heartbeat instructions (read by agent via filesystem tools)
-skills/
-  <name>/
-    SKILL.md
+<instance>/                 e.g. ~/.tinyctx, or anywhere via --dir
+├── config.yaml             Loaded by default from here (workspace.path / data.path default relative to this file)
+├── workspace/               Agent-authored content — visible to the agent's own filesystem tools
+│   ├── SOUL.md              Agent personality (loaded every turn)
+│   ├── AGENTS.md            Sub-agent/persona definitions
+│   ├── CRON.json            Scheduled jobs
+│   ├── HEARTBEAT.md         Heartbeat instructions
+│   ├── downloads/           Files/images sent by users via bridges
+│   ├── uploads/             Large attachments saved instead of inlined
+│   ├── skills/<name>/SKILL.md
+│   └── rag/, memory/*.md    Semantic search corpus (RAG module; distinct from the data/memory/ graph below)
+└── data/                     TinyCTX-internal state — NOT visible to the agent's filesystem tools
+    ├── agent.db              Conversation tree (SQLite)
+    ├── users.db              UserStore
+    ├── cursors/               Per-bridge session cursors (discord.json, discord_msg_nodes.json, cli)
+    └── memory/                LadybugDB graph (graph.lbug), librarian.log, dedup_cache.db
 ```
+
+Docker Compose (`compose.yaml`, always at the repo root, shared across instances) is invoked with `-f <repo>/compose.yaml -p <project>` plus env vars (`TINYCTX_CONFIG_FILE`, `TINYCTX_WORKSPACE`, `TINYCTX_DATA`, `TINYCTX_PORT`, `TINYCTX_INSTANCE`, `TINYCTX_TAG`) computed by `commands/_instance.py` from the resolved instance dir — see `compose_env()`. `TINYCTX_TAG` is a separate, short (6 hex char) hash from `TINYCTX_INSTANCE` because Docker bridge interface names are capped at 15 chars (`IFNAMSIZ`) on Linux.
+
+Non-Docker launches (`onboard`'s direct `python main.py` spawn) instead set `TINYCTX_CONFIG_FILE` in the subprocess env; `main.py` reads it if present, else defaults to `config.yaml` relative to CWD.
 
 ---
 
