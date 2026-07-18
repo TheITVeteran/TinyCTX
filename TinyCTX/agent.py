@@ -64,9 +64,13 @@ class AgentCycle:
         # --- 1. Resource Setup (Lazy Loading) ---
         if not self.db:
             from TinyCTX.db import ConversationDB
-            workspace = Path(self.config.workspace.path).expanduser().resolve()
-            workspace.mkdir(parents=True, exist_ok=True)
-            self.db = ConversationDB(workspace / "agent.db")
+            # Must match Runtime's DB location (data/agent.db, not workspace/) —
+            # runtime.push() writes inbound nodes there, so this cycle needs to
+            # see the same file or every add_node() here fails FOREIGN KEY
+            # (parent_id pointing at a node that only exists in the other file).
+            data_path = Path(self.config.data.path).expanduser().resolve()
+            data_path.mkdir(parents=True, exist_ok=True)
+            self.db = ConversationDB(data_path / "agent.db")
 
         # Load session state (model choice, enabled tools, etc.)
         state, _ = self.db.load_session_state(node_id)
