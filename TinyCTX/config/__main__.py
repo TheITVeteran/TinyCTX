@@ -90,6 +90,30 @@ class PermissionsConfig:
 
 
 @dataclass
+class ToolOverrideConfig:
+    """
+    Per-tool override of registration-time defaults (always_on / min_permission).
+
+    Configured via the top-level 'tool_overrides:' key in config.yaml:
+
+        tool_overrides:
+          shell:
+            min_permission: 80
+          present:
+            always_on: true
+          memory_search:
+            always_on: false
+            min_permission: 10
+
+    Fields left unset (null/omitted) leave that aspect of the tool untouched —
+    only the fields you specify are overridden. Unknown tool names are ignored
+    (logged at debug level) since not every module is loaded in every config.
+    """
+    always_on:      bool | None = None
+    min_permission: int | None  = None
+
+
+@dataclass
 class AttachmentConfig:
     """
     Thresholds that control whether attachments are inlined into the
@@ -255,6 +279,7 @@ class Config:
     context:         int                     = 16384
     attachments:     AttachmentConfig        = field(default_factory=AttachmentConfig)
     permissions:     PermissionsConfig       = field(default_factory=PermissionsConfig)
+    tool_overrides:  dict[str, ToolOverrideConfig] = field(default_factory=dict)
     # Catch-all for unknown top-level keys (e.g. mcp:, custom module config, etc.)
     # Modules access this via agent.config.extra.get("mcp", {})
     extra:           dict                    = field(default_factory=dict)
@@ -309,6 +334,24 @@ def _parse_fallback_on(raw: dict) -> FallbackOnConfig:
     )
 
 
+def _parse_tool_overrides(raw: dict) -> dict[str, ToolOverrideConfig]:
+    overrides: dict[str, ToolOverrideConfig] = {}
+    for tool_name, o in (raw or {}).items():
+        if not isinstance(o, dict):
+            raise ValueError(f"tool_overrides.{tool_name} must be a mapping")
+        always_on = o.get("always_on")
+        min_permission = o.get("min_permission")
+        if always_on is not None:
+            always_on = bool(always_on)
+        if min_permission is not None:
+            min_permission = int(min_permission)
+        overrides[tool_name] = ToolOverrideConfig(
+            always_on=always_on,
+            min_permission=min_permission,
+        )
+    return overrides
+
+
 def _parse_model(raw: dict) -> ModelConfig:
     if not raw.get("base_url"):
         raise ValueError("Model config missing required field: base_url")
@@ -357,6 +400,7 @@ def _parse_model(raw: dict) -> ModelConfig:
 _KNOWN_KEYS = {
     "models", "llm", "router", "bridges", "gateway", "workspace", "data",
     "logging", "max_tool_cycles", "parallel", "context", "attachments", "permissions",
+    "tool_overrides",
 }
 
 
@@ -467,6 +511,9 @@ def load(path="config.yaml") -> Config:
     if parallel < 1:
         raise ValueError(f"parallel must be >= 1, got {parallel}")
 
+    # ------------------------------------------------------------------ tool_overrides
+    tool_overrides = _parse_tool_overrides(raw.get("tool_overrides", {}))
+
     # ------------------------------------------------------------------ extra
     extra = {k: v for k, v in raw.items() if k not in _KNOWN_KEYS}
 
@@ -487,6 +534,7 @@ def load(path="config.yaml") -> Config:
         context=int(raw.get("context", 16384)),
         attachments=attachments,
         permissions=permissions,
+        tool_overrides=tool_overrides,
         extra=extra,
     )
     setattr(cfg, "_source_path", p.resolve())

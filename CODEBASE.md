@@ -199,6 +199,8 @@ Every `LLM.stream()` / `Embedder.embed()` / `embed_one()` call is admission-cont
 
 Permission levels: 0–100. Each tool has a `min_permission`. `minimal_tokens=True` hides tools the caller can't use.
 
+`apply_overrides(overrides)` — applies config-driven per-tool `always_on`/`min_permission` overrides (see `tool_overrides:` in Config, above) after all modules have registered their tools. `always_on=True` adds the tool to `enabled`, `False` removes it; `min_permission` is written straight onto the tool's registration dict. Fields left `None` on an override are no-ops.
+
 ---
 
 ## Module System (`module_registry.py`)
@@ -351,6 +353,7 @@ YAML-based. Loaded from `<instance>/config.yaml` by default (see Instance Layout
 - `gateway.enabled` / `gateway.host` / `gateway.port` / `gateway.api_key` (`gateway.port` can be overridden per-instance via `TINYCTX_PORT` env, injected by `tinyctx start`)
 - `logging.level`
 - `permissions.minimal_tokens` — hide tools from LLM that the caller can't use
+- `tool_overrides` — dict of `<tool_name>: {always_on?, min_permission?}`, applied once per `AgentCycle.run()` right after `module_registry.register_agent(self)` (so it wins over whatever each module's `register_tool()` call set). Unknown tool names are skipped with a debug log (not every module is loaded in every config). Parsed into `Config.tool_overrides: dict[str, ToolOverrideConfig]`; applied via `ToolCallHandler.apply_overrides()`.
 
 ---
 

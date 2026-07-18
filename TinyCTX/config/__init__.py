@@ -16,6 +16,7 @@ from TinyCTX.config.__main__ import (
     LoggingConfig,
     AttachmentConfig,
     PermissionsConfig,
+    ToolOverrideConfig,
 )
 
 __all__ = [
@@ -34,4 +35,5 @@ __all__ = [
     "LoggingConfig",
     "AttachmentConfig",
     "PermissionsConfig",
+    "ToolOverrideConfig",
 ]

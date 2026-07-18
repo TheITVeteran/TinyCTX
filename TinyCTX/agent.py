@@ -101,6 +101,11 @@ class AgentCycle:
         # Wire modules into this cycle turn
         self.module_registry.register_agent(self)
 
+        # Config-driven per-tool overrides (always_on / min_permission) — applied
+        # last so they win over whatever each module's register_tool() call set.
+        if self.config.tool_overrides:
+            self.tool_handler.apply_overrides(self.config.tool_overrides)
+
         # --- 2. Generation Loop ---
         # Tracker for metadata yielded in events
         meta = {
