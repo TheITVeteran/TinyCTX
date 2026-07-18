@@ -113,6 +113,7 @@ All cross-layer communication uses these frozen dataclasses/enums. No business l
 | `AgentToolResult` | Tool result |
 | `AgentError` | LLM error or cycle limit reached |
 | `AgentOutboundFiles` | File paths to deliver to the user (from `present()` tool) |
+| `AgentTextFinal.suppressed` | `True` when the agent's entire final reply was the literal sentinel `NO_REPLY` (see `agent.py`'s `NO_REPLY_TOKEN`) — bridges discard any buffered/streamed text and send nothing. Documented for the model in `modules/equipment_manifest/EM.md`. |
 | `ToolCall` / `ToolResult` | Internal tool call/result; distinct from Agent* event types |
 | `Attachment` | File attached to an inbound message |
 | `IMAGE_BLOCK_PREFIX` | Sentinel prefix returned by filesystem view() for images |
@@ -313,7 +314,7 @@ Cursors (`dm:<uid>`, `group:<cid>`, `thread:<tid>`) are persisted in
 
 ### `memory` — LadybugDB property-graph knowledge store, stored at `<instance>/data/memory/graph.lbug` (not workspace/). A background "librarian" walks unvisited conversation nodes (tracked with DB flags), extracts entities/relationships via sub-agents, and writes to the graph. Main agent uses `kg_search` / `kg_traverse` / `call_librarian` tools. Pinned entities are injected into the system prompt. The librarian identifies the agent by reading `author_id` on assistant nodes (set from session state `agent_name`); this is how it knows which speaker is the agent vs the user in the conversation transcript. Conversation excerpts passed to the buffer agent are rendered by `nodes_to_text()` (`librarian_agents.py`) as `【author】: content` lines (fullwidth brackets, matching `context.py`'s convention); content is passed through `_sanitize_brackets()` first so it cannot forge this delimiter. Deduplication's `dedup_cache.db` also lives under `data/` (`dedup_agents.py`'s `run_dedup_cycle` takes `data_path`, not a workspace path).
 
-### `heartbeat` — fires periodic agent turns on a background DB branch at a configured interval. Suppresses `HEARTBEAT_OK` replies. Slash command: `/heartbeat run`.
+### `heartbeat` — fires periodic agent turns on a background DB branch at a configured interval. Suppresses `NO_REPLY` replies (same sentinel as `agent.py`'s `NO_REPLY_TOKEN` — unified single marker, was `HEARTBEAT_OK`). Slash command: `/heartbeat run`.
 
 ### `cron` — CRON.json-backed job scheduler; creates agent turns at specified times.
 

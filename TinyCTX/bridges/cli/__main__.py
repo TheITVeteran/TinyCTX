@@ -341,17 +341,22 @@ class CLIBridge:
                 end="")
             self._console.print(preview, markup=False, style="bright_black")
         elif isinstance(event, (AgentTextFinal, _FakeTextFinal)):
-            # 1. Capture the text
-            final_text = (event.text or self._current_content).strip()
-            
-            # 2. Shut down the live display immediately 
+            # 1. Capture the text (NO_REPLY suppresses any streamed content)
+            suppressed = getattr(event, "suppressed", False)
+            final_text = "" if suppressed else (event.text or self._current_content).strip()
+
+            # 2. Shut down the live display immediately
             # (This flushes the current state to the console once)
-            self._stop_live() 
-            
+            if suppressed:
+                self._current_content = ""
+            self._stop_live()
+
             # 3. Clean up for next message
             if final_text:
                 self._last_reply = final_text
-                
+            elif suppressed:
+                self._console.print(f"  [{c('tool_ok')}]·  (no reply)[/{c('tool_ok')}]")
+
             self._current_content = ""
             self._thinking_content = ""
             self._label_printed = False

@@ -108,7 +108,12 @@ def _event_to_dict(event) -> dict:
     if isinstance(event, AgentTextChunk):
         return {"type": "text_chunk", "text": event.text}
     if isinstance(event, AgentTextFinal):
-        return {"type": "text_final", "text": event.text, "node_id": event.tail_node_id}
+        return {
+            "type": "text_final",
+            "text": "" if event.suppressed else event.text,
+            "node_id": event.tail_node_id,
+            "suppressed": event.suppressed,
+        }
     if isinstance(event, AgentToolCall):
         return {"type": "tool_call", "tool_name": event.tool_name,
                 "call_id": event.call_id, "args": event.args}
