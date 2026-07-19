@@ -67,6 +67,30 @@ def run(mode: Mode) -> str:
     return workspace
 
 
+def ask_app_whitelist(mode: Mode) -> list[str]:
+    """
+    Ask whether the filesystem module's tools (view/grep/glob_search) should
+    be able to read the bot's own code, read-only, by whitelisting /app/
+    (see modules/filesystem's read_only_paths config).
+
+    Returns ["/app"] if the user opts in, else [].
+    """
+    if mode == "quickstart":
+        return []
+
+    c.print(
+        "\n  The filesystem module can optionally let the agent's tools "
+        "VIEW (read-only)\n  its own source code at [bold]/app/[/] — useful "
+        "for self-inspection/debugging.\n  It can never write there.\n"
+    )
+    allow = questionary.confirm(
+        "Allow read-only access to /app/ (the bot's own code)?",
+        default=False,
+        style=QSTYLE,
+    ).ask()
+    return ["/app"] if allow else []
+
+
 # ── private helpers ───────────────────────────────────────────────────────────
 
 def _bootstrap(ws_path: Path) -> None:

@@ -9,37 +9,27 @@ onboard/gateway_setup.py — Step 4: Gateway port, API key, launch, and health c
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-import os
 import secrets
 import socket
-import subprocess
 import sys
-import time
 from typing import Any
-from pathlib import Path
 import questionary
 
 from .helpers import (
     CONFIG_PATH,
     DEFAULT_GATEWAY_HOST,
     DEFAULT_GATEWAY_PORT,
-    REPO_ROOT,
+    INSTANCE_DIR,
     GoBack,
     Mode,
     QSTYLE,
     c,
-    health_ping,
     section,
     success,
     warn,
 )
-
-HEALTH_CHECK_TIMEOUT  = 15    # seconds
-HEALTH_CHECK_INTERVAL = 1.0   # seconds
-
-# main.py lives at TinyCTX/TinyCTX/main.py (REPO_ROOT/TinyCTX is the TinyCTX package dir)
-_MAIN_PY = REPO_ROOT / "TinyCTX" / "main.py"
 
 
 def run(mode: Mode) -> dict[str, Any]:
@@ -90,14 +80,18 @@ def run(mode: Mode) -> dict[str, Any]:
 
 def launch(gateway: dict[str, Any]) -> None:
     """
-    Spawn main.py as a detached background process and poll /v1/health.
+    Start the gateway via `tinyctx start` (Docker Compose) and poll /v1/health.
     Call this AFTER write_config() so the daemon finds a valid config on disk.
+
+    TinyCTX runs in Docker, not on bare metal — so onboarding must hand off to
+    the same `tinyctx start` path as the CLI, rather than spawning main.py
+    as a local process (which isn't how the gateway is meant to run).
     """
     host    = gateway["host"]
     port    = gateway["port"]
     api_key = gateway["api_key"]
 
-    if not _launch_and_healthcheck(host, port):
+    if not _launch_via_tinyctx_start():
         sys.exit(1)
 
     _launch_cli_bridge(host, port, api_key)
@@ -105,62 +99,26 @@ def launch(gateway: dict[str, Any]) -> None:
 
 # ── private: launch & health check ───────────────────────────────────────────
 
-def _launch_and_healthcheck(host: str, port: int) -> bool:
+def _launch_via_tinyctx_start() -> bool:
     """
-    Spawn main.py as a detached background process (mirroring commands/start.py)
-    and poll /v1/health every second until healthy or the 15-second timeout
-    expires.
+    Delegate to `tinyctx start`'s Docker Compose launch + health check.
 
-    Returns True on success, False on timeout.
+    Returns True on success. `commands.start.run` calls sys.exit(1) itself
+    on failure (Docker missing, compose failure, or health check timeout),
+    so we catch that and propagate a bool instead.
     """
     section("Launching Gateway")
-    c.print(f"  Starting gateway on http://{host}:{port} …\n")
+    c.print("  Starting gateway via `tinyctx start` (Docker Compose) …\n")
 
-    log_file = CONFIG_PATH.parent / "daemon.log"
-    log_file.parent.mkdir(parents=True, exist_ok=True)
+    from TinyCTX.commands.start import run as start_run
 
-    env = {**os.environ, "TINYCTX_CONFIG_FILE": str(CONFIG_PATH)}
-
-    with open(log_file, "a") as lf:
-        if sys.platform == "win32":
-            subprocess.Popen(
-                [sys.executable, str(_MAIN_PY)],
-                cwd=str(REPO_ROOT),
-                env=env,
-                stdout=lf,
-                stderr=lf,
-                creationflags=subprocess.DETACHED_PROCESS
-                              | subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
-        else:
-            subprocess.Popen(
-                [sys.executable, str(_MAIN_PY)],
-                cwd=str(REPO_ROOT),
-                env=env,
-                stdout=lf,
-                stderr=lf,
-                start_new_session=True,
-            )
-
-    c.print("  Waiting for gateway", end="")
-    for _ in range(HEALTH_CHECK_TIMEOUT):
-        time.sleep(HEALTH_CHECK_INTERVAL)
-        if health_ping(host, port):
-            c.print()
-            success(
-                "Gateway is up! Starting CLI — type your first message to begin.\n"
-                f"  Logs: {log_file}"
-            )
-            return True
-        c.print(".", end="")
-
-    c.print()
-    warn(
-        f"Gateway did not respond after {HEALTH_CHECK_TIMEOUT} seconds.\n"
-        f"  Check {log_file} for errors.\n"
-        "  Please report this issue at: https://github.com/itzpingcat/TinyCTX/issues"
-    )
-    return False
+    args = argparse.Namespace(dir=str(INSTANCE_DIR), config=str(CONFIG_PATH))
+    try:
+        start_run(args)
+    except SystemExit as exc:
+        if exc.code:
+            return False
+    return True
 
 
 def _launch_cli_bridge(host: str, port: int, api_key: str) -> None:
