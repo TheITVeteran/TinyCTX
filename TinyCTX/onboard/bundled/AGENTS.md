@@ -17,8 +17,6 @@ These files are always injected into your context at session start. Understand w
 
 Your long-term memory (knowledge graph, conversation history) is maintained automatically and isn't something you read or write directly — use the `kg_search`, `kg_traverse`, and `call_librarian` tools instead of trying to open its files.
 
-Daily session notes live at `memory/session-YYYY-MM-DD.md`. These are raw logs — create one per day if it doesn't exist, and append to it as the session progresses.
-
 ---
 
 ## Memory Discipline

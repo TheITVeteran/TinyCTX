@@ -139,6 +139,7 @@ def assemble_config(
     bridges:         dict,
     max_tool_cycles: int,
     existing:        dict | None,
+    filesystem_read_only_paths: list[str] | None = None,
 ) -> dict:
     base = existing or {}
 
@@ -168,11 +169,15 @@ def assemble_config(
         existing_bridges[name] = bcfg
     base["bridges"] = existing_bridges
 
-    mem = base.get("memory_search", {})
-    mem["auto_inject"] = True
+    mem = base.get("memory", {})
     if embed_cfg:
         mem["embedding_model"] = "embed"
-    base["memory_search"] = mem
+    base["memory"] = mem
+
+    if filesystem_read_only_paths is not None:
+        fs = base.get("filesystem", {})
+        fs["read_only_paths"] = filesystem_read_only_paths
+        base["filesystem"] = fs
 
     base.setdefault("logging", {"level": "INFO"})
     base["max_tool_cycles"] = max_tool_cycles

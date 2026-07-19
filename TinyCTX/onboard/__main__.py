@@ -244,6 +244,7 @@ def run_wizard(providers: dict, beginner_providers: dict, existing: dict | None,
         embed = existing.get("models", {}).get("embed")
         results["embed_cfg"] = embed
         results["workspace"] = existing.get("workspace", {}).get("path", "~/.tinyctx")
+        results["filesystem_read_only_paths"] = existing.get("filesystem", {}).get("read_only_paths", [])
         results["bridges"]   = existing.get("bridges", {"cli": {"enabled": True}})
         results["gateway"]   = existing.get("gateway", {})
 
@@ -286,6 +287,7 @@ def run_wizard(providers: dict, beginner_providers: dict, existing: dict | None,
 
             elif current == "workspace":
                 results["workspace"] = workspace_setup.run(mode)
+                results["filesystem_read_only_paths"] = workspace_setup.ask_app_whitelist(mode)
 
             elif current == "gateway":
                 # Collect config only — do NOT launch yet (config not written yet)
@@ -312,6 +314,7 @@ def run_wizard(providers: dict, beginner_providers: dict, existing: dict | None,
         results["bridges"],
         max_tool_cycles,
         existing,
+        results.get("filesystem_read_only_paths", []),
     )
     write_config(data)
     success(f"Config written to [bold]{CONFIG_PATH}[/]")
